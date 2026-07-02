@@ -188,8 +188,9 @@ def _requires_bearer_auth(base_url: str | None) -> bool:
     Some third-party /anthropic endpoints implement Anthropic's Messages API but
     require Authorization: Bearer instead of Anthropic's native x-api-key header.
     MiniMax's global and China Anthropic-compatible endpoints, Azure AI
-    Foundry's Anthropic-style endpoint, Palantir Foundry's LLM proxy, and Nous
-    Portal's Messages route follow this pattern.
+    Foundry's Anthropic-style endpoint, Palantir Foundry's LLM proxy, Nous
+    Portal's Messages route, and Volcengine Ark's coding plan endpoint
+    follow this pattern.
     """
     if _is_nous_portal_endpoint(base_url):
         return True
@@ -209,6 +210,7 @@ def _requires_bearer_auth(base_url: str | None) -> bool:
         # not Anthropic's native x-api-key header. Hostname match for the
         # same reason as above.
         or base_url_host_matches(normalized, "api.commandcode.ai")
+        or normalized.startswith("https://ark.cn-beijing.volces.com")  # Volcengine Ark coding plan
     )
 
 
