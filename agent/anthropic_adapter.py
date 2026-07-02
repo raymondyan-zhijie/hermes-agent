@@ -533,8 +533,9 @@ def _requires_bearer_auth(base_url: str | None) -> bool:
 
     Some third-party /anthropic endpoints implement Anthropic's Messages API but
     require Authorization: Bearer instead of Anthropic's native x-api-key header.
-    MiniMax's global and China Anthropic-compatible endpoints, and Azure AI
-    Foundry's Anthropic-style endpoint follow this pattern.
+    MiniMax's global and China Anthropic-compatible endpoints, Azure AI
+    Foundry's Anthropic-style endpoint, and Volcengine Ark's coding plan
+    endpoint follow this pattern.
     """
     normalized = _normalize_base_url_text(base_url)
     if not normalized:
@@ -543,6 +544,7 @@ def _requires_bearer_auth(base_url: str | None) -> bool:
     return (
         normalized.startswith(("https://api.minimax.io/anthropic", "https://api.minimaxi.com/anthropic"))
         or "azure.com" in normalized
+        or normalized.startswith("https://ark.cn-beijing.volces.com")
     )
 
 
