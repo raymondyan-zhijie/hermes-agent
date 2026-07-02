@@ -712,6 +712,9 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "deepseek/deepseek-r1-0528",
         "qwen/qwen3-235b-a22b-fp8",
     ],
+    "volcano-coding-plan": [
+        "ark-code-latest",
+    ],
 }
 
 # Vercel AI Gateway: derive the bare-model-id catalog from the curated
