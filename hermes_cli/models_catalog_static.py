@@ -293,6 +293,9 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "moonshotai/kimi-k2.5", "minimax/minimax-m2.7", "zai-org/glm-5", "deepseek/deepseek-v3-0324",
         "deepseek/deepseek-r1-0528", "qwen/qwen3-235b-a22b-fp8",
     ],
+    "volcano-coding-plan": [
+        "ark-code-latest",
+    ],
     # Bare ids derived from the picker snapshot so both stay in sync.
     "ai-gateway": [mid for mid, _ in VERCEL_AI_GATEWAY_MODELS],
 }

@@ -888,6 +888,16 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             ref_item = (item.get("ref_msg") or {}).get("message_item")
             for candidate in (item, ref_item) if isinstance(ref_item, dict) else (item,):
                 await self._collect_media(candidate, media_paths, media_types)
+
+        # Auto-vision: if main model doesn't support images natively (e.g.
+        # MiniMax-M3 in models_dev_cache has attachment: false), the LLM
+        # receives an empty text and the image is silently dropped. Detect
+        # this case and prepend a vision-analyze description to text so the
+        # LLM at least knows what the user sent. Wrapped in try/except so a
+        # vision failure never blocks the message path.
+        if media_paths and not text:
+            text = await self._maybe_attach_vision_descriptions(media_paths, media_types)
+
         if not text and not media_paths:
             return
         source = self.build_source(chat_id=effective_chat_id, chat_type=chat_type, user_id=sender_id, user_name=sender_id)
@@ -912,6 +922,52 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         if path:
             media_paths.append(path)
             media_types.append(mime)
+
+    async def _maybe_attach_vision_descriptions(
+        self, media_paths: List[str], media_types: List[str]
+    ) -> str:
+        """Run vision_analyze_tool on inbound images when the main model can't see them.
+
+        Only triggers for image MIME types. Returns a Chinese-language prefix
+        that can be prepended to the user text. Never raises — a vision failure
+        becomes a placeholder so the LLM still gets a non-empty message.
+        """
+        prompts: List[str] = []
+        for path, mime in zip(media_paths, media_types):
+            if not (mime or "").startswith("image/"):
+                continue
+            if not (path and os.path.isfile(path)):
+                continue
+            try:
+                from tools.vision_tools import vision_analyze_tool
+
+                prompt = (
+                    "请详细描述这张图片里所有产品的外观、型号、屏幕显示内容、按键、接口、配件。"
+                )
+                # 60s cap per image; this runs in the inbound event loop.
+                result = await asyncio.wait_for(
+                    vision_analyze_tool(path, prompt, model="MiniMax-M3"),
+                    timeout=60.0,
+                )
+                try:
+                    parsed = json.loads(result) if isinstance(result, str) else result
+                    description = (parsed or {}).get("analysis") or ""
+                except Exception:
+                    description = str(result) if result else ""
+                if description and not description.startswith("There was a problem"):
+                    prompts.append(f"[图片 {os.path.basename(path)} 的视觉分析]\n{description}")
+                else:
+                    prompts.append(f"[用户发了一张图:{os.path.basename(path)},视觉分析失败,请让用户口述]")
+            except asyncio.TimeoutError:
+                logger.warning("[%s] vision analyze timeout for %s", self.name, path)
+                prompts.append(f"[用户发了一张图:{os.path.basename(path)},视觉分析超时]")
+            except Exception as exc:
+                logger.warning("[%s] vision analyze failed for %s: %s", self.name, path, exc)
+                prompts.append(f"[用户发了一张图:{os.path.basename(path)},视觉分析失败,请让用户口述]")
+
+        if not prompts:
+            return ""
+        return "\n\n".join(prompts) + "\n\n请基于以上图片内容回应用户。"
 
     async def _download_media(self, item: Dict[str, Any], spec: Tuple[Any, ...]) -> Tuple[Optional[str], str]:
         """Download + decrypt one inbound media item -> (cached path or None, mime). Voice is always downloaded
