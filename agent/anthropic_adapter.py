@@ -1863,6 +1863,45 @@ def convert_tools_to_anthropic(tools: List[Dict]) -> List[Dict]:
     return result
 
 
+import contextvars
+
+# Base URL of the current Anthropic-compatible target, set by
+# convert_messages_to_anthropic so _image_source_from_openai_url can apply
+# provider-specific image transcoding (MiniMax drops PNG; others accept it).
+_anthropic_base_url_ctx: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+    "anthropic_base_url", default=None
+)
+
+
+def _png_to_jpeg_base64(png_b64: str) -> Optional[str]:
+    """Transcode a base64 PNG to base64 JPEG.
+
+    MiniMax's Anthropic-compatible endpoint does not decode PNG image inputs
+    (the request succeeds but the model reports "No image attached"). JPEG
+    works, so we transcode PNG data URLs to JPEG *only when targeting MiniMax*.
+    Alpha is flattened onto a white background (JPEG has no alpha channel).
+    """
+    try:
+        import base64 as _b64
+        from io import BytesIO
+        from PIL import Image
+        raw = _b64.b64decode(png_b64)
+        with Image.open(BytesIO(raw)) as im:
+            if im.mode != "RGB":
+                bg = Image.new("RGB", im.size, (255, 255, 255))
+                if im.mode in ("RGBA", "LA"):
+                    bg.paste(im, mask=im.split()[-1])
+                else:
+                    bg.paste(im.convert("RGB"))
+                im = bg
+            buf = BytesIO()
+            im.save(buf, format="JPEG", quality=92)
+            return _b64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception as exc:
+        logger.warning("anthropic_adapter: PNG->JPEG transcode failed: %s", exc)
+        return None
+
+
 def _image_source_from_openai_url(url: str) -> Dict[str, str]:
     """Convert an OpenAI-style image URL/data URL into Anthropic image source."""
     url = str(url or "").strip()
@@ -1876,6 +1915,15 @@ def _image_source_from_openai_url(url: str) -> Dict[str, str]:
             mime_part = header[len("data:"):].split(";", 1)[0].strip()
             if mime_part.startswith("image/"):
                 media_type = mime_part
+        # MiniMax's Anthropic endpoint silently drops PNG inputs (model reports
+        # "No image attached"). Only transcode for MiniMax targets — Z.AI and
+        # native Anthropic handle PNG correctly, preserving alpha/quality.
+        _base_url = _anthropic_base_url_ctx.get() or ""
+        if media_type == "image/png" and "minimax" in _base_url.lower():
+            _jpeg = _png_to_jpeg_base64(data)
+            if _jpeg is not None:
+                data = _jpeg
+                media_type = "image/jpeg"
         return {
             "type": "base64",
             "media_type": media_type,
@@ -2843,6 +2891,7 @@ def convert_messages_to_anthropic(
     assistant tool-call messages — Kimi requires the field to exist, even
     if empty.
     """
+    _anthropic_base_url_ctx.set(base_url)
     system = None
     result: List[Dict[str, Any]] = []
 
