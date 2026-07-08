@@ -636,6 +636,12 @@ def _to_openai_base_url(base_url: str) -> str:
             rewritten = url[: -len("/anthropic")] + "/paas/v4"
             logger.debug("Auxiliary client: rewrote ZAI base URL %s → %s", url, rewritten)
             return rewritten
+        # api.z.ai: /api/v1 returns 403 (model_access_denied), /api/paas/v4
+        # returns 429 (balance). Keep /api/anthropic — the Anthropic wire
+        # works (vision uses messages API via create_anthropic_message).
+        if "api.z.ai" in url:
+            logger.debug("Auxiliary client: keeping api.z.ai Anthropic base URL %s", url)
+            return url
         rewritten = url[: -len("/anthropic")] + "/v1"
         logger.debug("Auxiliary client: rewrote base URL %s → %s", url, rewritten)
         return rewritten
@@ -4484,7 +4490,7 @@ def resolve_provider_client(
         # Anthropic-wire endpoints (Kimi Coding Plan api.kimi.com/coding,
         # /anthropic-suffixed gateways) so named providers like kimi-coding
         # land on the right transport without needing per-provider branches.
-        client = _wrap_if_needed(client, final_model, raw_base_url, api_key)
+        client = _wrap_if_needed(client, final_model, base_url, api_key)
 
         logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
         return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
