@@ -1520,7 +1520,21 @@ class WeixinAdapter(BasePlatformAdapter):
         # LLM at least knows what the user sent. Wrapped in try/except so a
         # vision failure never blocks the message path.
         if media_paths and not text:
-            text = await self._maybe_attach_vision_descriptions(media_paths, media_types)
+            # Only pre-analyze with vision_analyze when the main model can't
+            # see images natively. When decide=native, base.py inlines the
+            # image and the main model sees it directly — no text pre-analysis
+            # needed (and the aux vision path can't build an OAuth client for
+            # minimax-oauth anyway). #vision-native
+            try:
+                from agent.image_routing import decide_image_input_mode
+                from agent.auxiliary_client import _read_main_provider, _read_main_model
+                from hermes_cli.config import load_config as _load_cfg
+                _wx_img_mode = decide_image_input_mode(
+                    _read_main_provider(), _read_main_model(), _load_cfg())
+            except Exception:
+                _wx_img_mode = "text"
+            if _wx_img_mode != "native":
+                text = await self._maybe_attach_vision_descriptions(media_paths, media_types)
 
         if not text and not media_paths:
             return
