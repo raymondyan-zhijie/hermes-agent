@@ -211,6 +211,7 @@ def _requires_bearer_auth(base_url: str | None) -> bool:
         # same reason as above.
         or base_url_host_matches(normalized, "api.commandcode.ai")
         or normalized.startswith("https://ark.cn-beijing.volces.com")  # Volcengine Ark coding plan
+        or base_url_host_matches(normalized, "maas.aliyuncs.com")  # Alibaba Cloud MaaS coding plan
     )
 
 
