@@ -59,15 +59,20 @@ def _save_all(data: Dict[str, Any]) -> None:
 def get_cached_entry(server_name: str, fingerprint: str) -> Optional[dict]:
     """Return cached entry when fingerprint matches (and TTL holds), else None. ``tools/list``
     results may carry ``ttlMs`` (SEP-2549); an entry older than a recorded TTL is a miss so the
-    next startup re-probes instead of serving a stale manifest forever. Entries without a TTL
-    never expire. ``cacheScope`` is irrelevant: this cache is per-user local disk."""
+    next startup re-probes instead of serving a stale manifest forever. Entries without a
+    POSITIVE TTL never expire: the mcp SDK defaults ``ttl_ms`` to 0 and a pydantic default is
+    indistinguishable from an explicit 0. ``cacheScope`` is irrelevant: this cache is per-user local disk."""
     with _cache_lock:
         entry = _load_all().get(server_name)
     if not isinstance(entry, dict) or entry.get("fingerprint") != fingerprint:
         return None
     ttl_ms = entry.get("ttl_ms")
     written_at = entry.get("written_at")
-    expired = (isinstance(ttl_ms, (int, float)) and isinstance(written_at, (int, float))
+    # A non-positive TTL means "no freshness hint", not "already stale" — every server that does
+    # not send ``ttlMs`` lands here as 0. Expiring on that makes the entry a permanent miss the
+    # instant it is written, silently degrading ``lazy: true`` servers into eager spawns forever
+    # (the cache lookup in register_mcp_servers never hits).
+    expired = (isinstance(ttl_ms, (int, float)) and ttl_ms > 0 and isinstance(written_at, (int, float))
                and (time.time() - written_at) * 1000.0 >= float(ttl_ms))
     return None if expired else entry
 
