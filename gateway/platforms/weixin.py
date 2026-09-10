@@ -86,6 +86,22 @@ def _is_session_expired(resp: Dict[str, Any], ret: Any, errcode: Any) -> bool:
     return SESSION_EXPIRED_ERRCODE in (ret, errcode) or _is_stale_session_ret(ret, errcode, resp.get("errmsg"))
 
 
+def _ilink_error_text(resp: Any) -> Optional[str]:
+    """iLink reports in-band failures as HTTP 200 with ``ret``/``errcode`` != 0.
+
+    Returns a human-readable description of such a failure, or ``None`` when the response is a
+    success. Callers that drop the response on the floor turn a rejection (e.g. ``ret=-2
+    "prepare failed"``) into a phantom success, so every send path must consult this.
+    """
+    if not isinstance(resp, dict):
+        return None
+    ret, errcode = resp.get("ret"), resp.get("errcode")
+    if (ret is None or ret == 0) and (errcode is None or errcode == 0):
+        return None
+    errmsg = resp.get("errmsg") or resp.get("msg") or "unknown error"
+    return f"ret={ret} errcode={errcode} errmsg={errmsg}"
+
+
 def _make_ssl_connector() -> Optional["aiohttp.TCPConnector"]:
     """TCPConnector with certifi's CA bundle (``ilinkai.weixin.qq.com`` fails some system stores, e.g. Homebrew
     OpenSSL); None without certifi so aiohttp's default (honors ``SSL_CERT_FILE`` under trust_env) applies.
@@ -1242,13 +1258,24 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         if media_type == MEDIA_VOICE and path.endswith(".silk"):
             item_kwargs.update(encode_type=6, sample_rate=24000, bits_per_sample=16)
         if caption:
-            await _send_message(
+            caption_response = await _send_message(
                 self._send_session, base_url=self._base_url, token=self._token, to=chat_id, text=self.format_message(caption),
                 context_token=context_token, client_id=f"hermes-weixin-{uuid.uuid4().hex}")
+            # An iLink reject here is HTTP 200 + ret != 0, so it is logged rather than silently
+            # dropped. It stays non-fatal: a lost caption does not mean the attachment was lost.
+            caption_error = _ilink_error_text(caption_response)
+            if caption_error:
+                logger.warning("[%s] caption not delivered to=%s: %s", self.name, _safe_id(chat_id), caption_error)
         last_message_id = f"hermes-weixin-{uuid.uuid4().hex}"
-        await _send_items(
+        response = await _send_items(
             self._send_session, base_url=self._base_url, token=self._token, to=chat_id, item_list=[item_builder(**item_kwargs)],
             context_token=context_token, client_id=last_message_id)
+        # Raise on an in-band iLink rejection so the failure reaches SendResult(success=False).
+        # Ignoring this response is what made `hermes send -t weixin "MEDIA:…"` print "Sent"
+        # while nothing was delivered ("发送了 ≠ 发送成功" at the code level).
+        media_error = _ilink_error_text(response)
+        if media_error:
+            raise RuntimeError(f"iLink sendmessage (media) failed to={_safe_id(chat_id)}: {media_error}")
         return last_message_id
 
     def _outbound_media_builder(self, path: str, force_file_attachment: bool = False):
