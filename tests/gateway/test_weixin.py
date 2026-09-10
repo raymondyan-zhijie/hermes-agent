@@ -434,8 +434,77 @@ class TestWeixinChunkDelivery:
         assert adapter._rate_limit_circuit_until == 0.0
 
 
-class TestWeixinOutboundMedia:
+class _StubCdnUploadSession:
+    """Session stub whose CDN upload POST always succeeds, so tests can drive the *sendmessage* response."""
 
+    def post(self, url, **kwargs):
+        class _Response:
+            status = 200
+            headers = {"x-encrypted-param": "enc-param"}
+
+            async def __aenter__(self_inner):
+                return self_inner
+
+            async def __aexit__(self_inner, exc_type, exc, tb):
+                return False
+
+            async def read(self_inner):
+                return b""
+
+            async def text(self_inner):
+                return ""
+
+        return _Response()
+
+
+class TestWeixinOutboundMedia:
+    @staticmethod
+    def _attached_adapter(tmp_path, name):
+        path = tmp_path / name
+        path.write_bytes(b"fake-bytes")
+        adapter = _make_adapter()
+        adapter._session = adapter._send_session = _StubCdnUploadSession()
+        adapter._token = "test-token"
+        adapter._base_url = "https://weixin.example.com"
+        adapter._cdn_base_url = "https://cdn.example.com/c2c"
+        adapter._token_store.get = lambda account_id, chat_id: None
+        return adapter, path
+
+    def test_send_file_raises_when_ilink_rejects_in_band(self, tmp_path):
+        """HTTP 200 + ret != 0 is a rejection; it must not become a phantom success."""
+        adapter, path = self._attached_adapter(tmp_path, "demo.png")
+
+        with patch("gateway.platforms.weixin._get_upload_url", new=AsyncMock(return_value={"upload_full_url": "https://upload.example.com/media"})), \
+             patch("gateway.platforms.weixin._api_post", new=AsyncMock(return_value={"ret": -2, "errmsg": "prepare failed"})):
+            with pytest.raises(RuntimeError) as excinfo:
+                asyncio.run(adapter._send_file("wxid_test123", str(path), ""))
+
+        assert "ret=-2" in str(excinfo.value)
+        assert "prepare failed" in str(excinfo.value)
+
+    def test_send_document_reports_failure_when_ilink_rejects_in_band(self, tmp_path):
+        """The `hermes send -t weixin` path must return success=False when iLink rejects the file."""
+        adapter, path = self._attached_adapter(tmp_path, "demo.pdf")
+
+        with patch("gateway.platforms.weixin._get_upload_url", new=AsyncMock(return_value={"upload_full_url": "https://upload.example.com/media"})), \
+             patch("gateway.platforms.weixin._api_post", new=AsyncMock(return_value={"ret": -2, "errmsg": "prepare failed"})):
+            result = asyncio.run(adapter.send_document("wxid_test123", str(path)))
+
+        assert result.success is False
+        assert "prepare failed" in (result.error or "")
+
+    def test_rejected_caption_is_logged_but_does_not_sink_the_attachment(self, tmp_path, caplog):
+        """A lost caption is not a lost attachment: warn, keep going, still return the media message id."""
+        adapter, path = self._attached_adapter(tmp_path, "demo.png")
+
+        with patch("gateway.platforms.weixin._get_upload_url", new=AsyncMock(return_value={"upload_full_url": "https://upload.example.com/media"})), \
+             patch("gateway.platforms.weixin._api_post", new=AsyncMock(side_effect=[
+                 {"ret": -2, "errmsg": "prepare failed"}, {"ret": 0}])), \
+             caplog.at_level("WARNING"):
+            message_id = asyncio.run(adapter._send_file("wxid_test123", str(path), "caption text"))
+
+        assert message_id.startswith("hermes-weixin-")
+        assert "caption not delivered" in caplog.text
 
     def test_send_file_uses_post_for_upload_full_url_and_hex_encoded_aes_key(self, tmp_path):
         class _UploadResponse:
