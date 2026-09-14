@@ -1,0 +1,5 @@
+name: volcano-coding-plan-provider
+kind: model-provider
+version: 1.0.0
+description: Volcengine Ark Coding Plan (Anthropic Messages via Bearer)
+author: admin@leimengde.net
