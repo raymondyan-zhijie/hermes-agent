@@ -171,6 +171,36 @@ def _memory_fields(item: Any, *keys: str) -> dict:
             for k in keys}
 
 
+def _memory_text(item: Any) -> str:
+    """Best-effort text for a search hit (never raises).
+
+    Aggregated memories routinely come back with an EMPTY ``memory`` attribute — their text lives
+    in ``chunk`` / ``context`` / ``documents`` — and rendering only ``memory`` turned those hits
+    into blank rows that still occupied ranking slots (measured 2026-09-17: ~83% of hits blank).
+    """
+    try:
+        direct = getattr(item, "memory", "") or ""
+        if isinstance(direct, str) and direct.strip():
+            return direct
+        for attr in ("chunk", "summary", "title", "content", "context"):
+            val = getattr(item, attr, None)
+            if isinstance(val, str) and val.strip():
+                return val
+        docs = getattr(item, "documents", None)
+        if isinstance(docs, (list, tuple)):
+            for d in docs:
+                if isinstance(d, str) and d.strip():
+                    return d
+                if isinstance(d, dict):
+                    for k in ("content", "title", "summary"):
+                        v = d.get(k)
+                        if isinstance(v, str) and v.strip():
+                            return v
+    except Exception:  # noqa: BLE001 — a rendering helper must never break a search
+        pass
+    return ""
+
+
 class _SupermemoryClient:
     def __init__(self, api_key: str, timeout: float, container_tag: str,
                  search_mode: str = "hybrid", base_url: str = ""):
@@ -206,7 +236,7 @@ class _SupermemoryClient:
         kwargs: dict[str, Any] = {"q": query, "container_tag": container_tag or self._container_tag, "limit": limit,
                                   **({"search_mode": mode} if mode in _VALID_SEARCH_MODES else {})}
         response = self._client.search.memories(**kwargs)
-        return [{**_memory_fields(item, "id", "memory", "similarity", "updated_at", "metadata"), "memory": getattr(item, "memory", "") or ""}
+        return [{**_memory_fields(item, "id", "memory", "similarity", "updated_at", "metadata"), "memory": _memory_text(item)}
                 for item in (getattr(response, "results", None) or [])]
 
     def get_profile(self, query: Optional[str] = None, *, container_tag: Optional[str] = None) -> dict:
@@ -222,6 +252,26 @@ class _SupermemoryClient:
 
     def forget_memory(self, memory_id: str, *, container_tag: Optional[str] = None) -> None:
         self._client.memories.forget(container_tag=container_tag or self._container_tag, id=memory_id)
+
+    def delete_document(self, document_id: str, *, attempts: int = 4, delay: float = 2.0) -> None:
+        """Delete a *document*. ``add_memory`` returns a document id, which the memory namespace
+        cannot forget — this is the correct counterpart for ids handed out by ``_tool_store``.
+
+        A freshly stored document answers ``409 Document is still processing`` until ingestion
+        finishes, so retry briefly instead of reporting a hard failure (measured 2026-09-17)."""
+        import time as _time
+        last: Optional[Exception] = None
+        for i in range(max(1, attempts)):
+            try:
+                self._client.documents.delete(id=document_id)
+                return
+            except Exception as exc:  # noqa: BLE001
+                last = exc
+                if "still processing" not in str(exc).lower() or i == attempts - 1:
+                    raise
+                _time.sleep(delay)
+        if last:  # pragma: no cover - loop always returns or raises
+            raise last
 
     def forget_by_query(self, query: str, *, container_tag: Optional[str] = None) -> dict:
         results = self.search_memories(query, limit=5, container_tag=container_tag)
@@ -508,8 +558,19 @@ class SupermemoryMemoryProvider(MemoryProvider):
         tag = self._tool_container_tag(args)  # not echoed in the response
         if not memory_id:
             return self._client.forget_by_query(query, container_tag=tag)
-        self._client.forget_memory(memory_id, container_tag=tag)
-        return {"forgotten": True, "id": memory_id}
+        # ``store`` hands out a *document* id while ``forget`` lives in the *memory* namespace,
+        # so forgetting an id the store just returned used to 404. Try both namespaces.
+        try:
+            self._client.forget_memory(memory_id, container_tag=tag)
+            return {"forgotten": True, "id": memory_id, "namespace": "memory"}
+        except Exception as mem_exc:  # noqa: BLE001 — any failure must fall through to documents
+            try:
+                self._client.delete_document(memory_id)
+                return {"forgotten": True, "id": memory_id, "namespace": "document"}
+            except Exception as doc_exc:  # noqa: BLE001
+                if "still processing" in str(doc_exc).lower():
+                    return tool_error(f"Document {memory_id} is still being ingested — retry this forget in a moment. (memory namespace: {mem_exc})")
+                return tool_error(f"Forget failed in both namespaces — memory: {mem_exc}; document: {doc_exc}")
 
     def _tool_profile(self, args: dict) -> dict:
         tag = self._tool_container_tag(args)
