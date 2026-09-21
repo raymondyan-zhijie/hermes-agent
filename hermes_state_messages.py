@@ -42,6 +42,32 @@ _SET_COUNTERS_SQL = "UPDATE sessions SET message_count = ?, tool_call_count = ?"
 _RESET_COUNTERS_SQL = "UPDATE sessions SET message_count = 0, tool_call_count = 0 WHERE id = ?"
 _SET_DISPLAY_META_SQL = "UPDATE messages SET display_metadata = ? WHERE id = ?"
 _ARCHIVE_ACTIVE_SQL = "UPDATE messages SET active = 0, compacted = 1 WHERE session_id = ? AND active = 1"
+# DB-level platform-id dedupe (#104653 / upstream PR #79610). A gateway-accepted turn is identified by
+# (session, platform id, gateway_input_owner) — the same predicate has_gateway_input_owner() uses, i.e.
+# a live OWNING row (observed = 0) carrying the same marker. Only then may a second write of the SAME
+# accepted turn be skipped. Deliberately NOT keyed on content or on the platform id alone: two
+# independently accepted identical inputs (same text, even the same platform id) must both survive —
+# tests/agent/test_codex_echo_ownership.py and evals/gateway_failure_ownership both pin this. Rows
+# without an owner marker are never deduped here. Scoped to ACTIVE rows on purpose: rewind/replace/
+# compaction soft-archive the superseded row in the same txn before re-inserting, so a re-insert stays legal.
+_ACTIVE_PLATFORM_ROW_SQL = (
+    "SELECT id FROM messages WHERE session_id = ? AND platform_message_id = ? AND active = 1 "
+    "AND observed = 0 AND CASE WHEN json_valid(display_metadata) THEN"
+    " json_extract(display_metadata, '$.gateway_input_owner') END = ?"
+    " ORDER BY id LIMIT 1")
+
+
+def _gateway_input_owner_of(msg: Dict[str, Any]) -> Optional[str]:
+    """``gateway_input_owner`` marker of a row dict, or None. display_metadata is a live dict on the agent's
+    flush path and an already-encoded JSON string on the gateway's append path."""
+    md = msg.get("display_metadata")
+    if isinstance(md, str):
+        try:
+            md = json.loads(md)
+        except (TypeError, ValueError):
+            return None
+    owner = md.get("gateway_input_owner") if isinstance(md, dict) else None
+    return owner if isinstance(owner, str) and owner else None
 _INVALID = object()  # _json_or sentinel where the fallback must be distinguishable from JSON null
 
 
@@ -298,6 +324,23 @@ class SessionMessagesMixin:
         def _do(conn):
             self._check_transcript_write_guards(conn, session_id, compression_lock_holder,
                 turn_lease_holder=turn_lease_holder, turn_lease_ttl_seconds=turn_lease_ttl_seconds)
+            if platform_message_id and not observed:
+                # DB-level platform-id dedupe (#104653): the gateway writes the inbound user row here on
+                # receipt, then the agent's turn-end flush re-writes it (append_messages_batch). The
+                # per-writer in-memory marker cannot see the other writer's row, so the check is done
+                # against the DB, INSIDE this write txn (same discipline as append_delegation_delivery:
+                # concurrent writers serialize on the lock, so they cannot both pass). Returns the existing
+                # row id so callers keep a valid handle; active=1 scoping keeps soft-archived re-inserts legal.
+                owner = _gateway_input_owner_of(msg)
+                if owner:
+                    dup = conn.execute(_ACTIVE_PLATFORM_ROW_SQL,
+                                       (session_id, str(platform_message_id), owner)).fetchone()
+                else:
+                    dup = None
+                if dup is not None:
+                    logger.info("Skipping duplicate platform message %s in session %s (active row %s)",
+                                platform_message_id, session_id, dup[0])
+                    return int(dup[0])
             msg_id = conn.execute(_INSERT_MESSAGE_SQL, params).lastrowid
             self._bump_session_counters(conn, session_id, 1, _tool_calls_count(tool_calls), unit=True)
             return msg_id
@@ -481,6 +524,25 @@ class SessionMessagesMixin:
         inserted = tool_calls_total = 0
         for msg in messages:
             role = msg.get("role", "unknown")
+            platform_message_id = msg.get("platform_message_id") or msg.get("message_id")
+            if platform_message_id and not msg.get("observed"):
+                # DB-level platform-id dedupe (#104653): the gateway persists the inbound user row on
+                # receipt and the agent flush re-inserts the same row at turn end; each writer's
+                # _DB_PERSISTED_MARKER is in-memory, so neither can see the other's committed row.
+                # Skipped IN PLACE (never dropped): sync_flushed_message_markers() zips rows to messages
+                # positionally, so dropping would desync the markers. The existing row id is stamped so
+                # the caller still treats the message as durable.
+                owner = _gateway_input_owner_of(msg)
+                if owner:
+                    dup = conn.execute(_ACTIVE_PLATFORM_ROW_SQL,
+                                       (session_id, str(platform_message_id), owner)).fetchone()
+                else:
+                    dup = None
+                if dup is not None:
+                    msg["_row_id"] = int(dup[0])
+                    logger.info("Skipping duplicate platform message %s in session %s (active row %s)",
+                                platform_message_id, session_id, dup[0])
+                    continue
             tool_calls = _parse_tool_calls(msg.get("tool_calls"))
             message_timestamp = _coerce_timestamp(msg.get("timestamp"), now_ts)
             cur = conn.execute(_INSERT_MESSAGE_SQL, self._message_row_params(
