@@ -27,6 +27,7 @@ suppress_platform_ver_console()
 import os
 import re
 import sys
+import uuid
 
 # Inline path math so ``python hermes_cli/main.py`` (script mode: sys.path[0]
 # is hermes_cli/, not the repo root) can import hermes_cli._startup_fast.
@@ -565,6 +566,9 @@ os.environ.setdefault(
     "HERMES_DISPATCH_CALLER_HOME",
     os.environ.get("HERMES_HOME") or os.environ.get("HERMES_SESSION_PROFILE") or "",
 )
+# Identity of THIS dispatch attempt. Minted once and inherited across the CLI's re-exec,
+# so the second evaluation (and the ledger-row consumption) belong to the same dispatch.
+os.environ.setdefault("HERMES_DISPATCH_ID", uuid.uuid4().hex)
 
 _apply_profile_override()
 
