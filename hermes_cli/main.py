@@ -556,7 +556,55 @@ def _apply_profile_override() -> None:
         sys.argv = sys.argv[:start] + sys.argv[start + consume :]
 
 
+# A1 (fork carry#16, 2026-09-21): remember where this process was launched FROM,
+# BEFORE _apply_profile_override() rewrites HERMES_HOME to the *target* profile (the
+# override runs on -p/--profile and the CLI may then re-exec itself, so a capture
+# taken afterwards would already read the target). setdefault: the outermost caller
+# wins, so nested spawns keep the origin.
+os.environ.setdefault(
+    "HERMES_DISPATCH_CALLER_HOME",
+    os.environ.get("HERMES_HOME") or os.environ.get("HERMES_SESSION_PROFILE") or "",
+)
+
 _apply_profile_override()
+
+
+def _a1_dispatch_guard_oneshot() -> None:
+    """A1 (fork carry#16): refuse a cross-profile oneshot dispatch that skipped the wrapper.
+
+    Runs ONCE per process, at import time, so it covers every launch path (the fast
+    chat/termux launchers, ``_run_oneshot_from_args`` and ``cmd_chat``) instead of
+    needing a hook in each. Only fires when argv looks like a non-interactive query.
+    """
+    if os.environ.get("HERMES_DISPATCH_DEBUG"):
+        print(f"[a1-main] 守卫被调用 pid={os.getpid()} argv={sys.argv[1:]}", file=sys.stderr)
+    if os.environ.get("HERMES_DISPATCH_GUARDED") == "1":
+        if os.environ.get("HERMES_DISPATCH_DEBUG"):
+            print("[a1-main] 已守卫过，跳过", file=sys.stderr)
+        return
+    # Never fire inside a test runner / embedded use: ``pytest -q`` carries the same
+    # ``-q`` token but is not a dispatch.
+    if os.environ.get("PYTEST_CURRENT_TEST") or "pytest" in os.path.basename(sys.argv[0] or ""):
+        return
+    argv = list(sys.argv[1:])
+    if not any(
+        a in {"-q", "--query", "-z", "--oneshot"}
+        or a.startswith("--query=")
+        or a.startswith("--oneshot=")
+        for a in argv
+    ):
+        return
+    source = None
+    for i, a in enumerate(argv):
+        if a == "--source" and i + 1 < len(argv):
+            source = argv[i + 1]
+    os.environ["HERMES_DISPATCH_GUARDED"] = "1"
+    from tools.dispatch_preflight import guard_dispatch
+
+    guard_dispatch(source=source, argv=argv)
+
+
+_a1_dispatch_guard_oneshot()
 
 # Windows launcher self-heal — the ``hermes`` command is a COPY of the venv
 # console script staged into the managed bin dir (outside the checkout, since
@@ -1685,6 +1733,17 @@ def cmd_chat(args):
     _apply_safe_mode(args)
     _apply_user_config_bypass(args)
     _guard_noninteractive_user_config(args)
+
+    # A1 pre-flight (fork carry#16, 2026-09-21): a *non-interactive* (oneshot) run that
+    # targets a profile other than the caller's must carry a dispatch-ledger entry —
+    # i.e. it must have gone through work/skill-workshop/hermes-dispatch.sh. Interactive
+    # sessions and same-profile runs are untouched; cron/kanban spawns are recognised
+    # by their own markers. Refusal is fail-closed: rc=2, audited, alert pushed.
+    if getattr(args, "query", None) or getattr(args, "image", None):
+        from tools.dispatch_preflight import guard_dispatch
+
+        guard_dispatch(source=getattr(args, "source", None))
+
     use_tui = _resolve_use_tui(args)
 
     _resolve_chat_session_args(args, use_tui)
