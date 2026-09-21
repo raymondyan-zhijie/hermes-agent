@@ -64,7 +64,36 @@ def profile_of(home: str | None) -> str:
     return "default"
 
 
+def _consumed_map() -> dict:
+    """key -> dispatch id that consumed it."""
+    path = os.path.join(_base(), "runtime/dispatch-consumed.jsonl")
+    out: dict = {}
+    if not os.path.exists(path):
+        return out
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for ln in fh:
+                if not ln.strip():
+                    continue
+                rec = json.loads(ln)
+                if "key" in rec:
+                    out[rec["key"]] = rec.get("disp_id") or ""
+    except (OSError, ValueError):
+        pass
+    return out
+
+
 def _ledger_allows(target: str, now: _dt.datetime, ttl: int) -> dict | None:
+    """Return the (unconsumed) ledger row that authorises this dispatch, else None.
+
+    One registration authorises exactly ONE dispatch: consumed rows are recorded in
+    ``runtime/dispatch-consumed.jsonl`` (2026-09-21: found while testing A1 — a single
+    row was letting later dispatches through for the whole 20-minute TTL).
+
+    The record carries the *dispatch id* of its consumer, and the CLI evaluates a launch
+    twice (parent + re-exec, same ``HERMES_DISPATCH_ID``): a row consumed by THIS
+    dispatch still authorises it, so the second evaluation does not turn into a refusal.
+    """
     path = os.path.join(_base(), "runtime/dispatch-ledger.jsonl")
     if not os.path.exists(path):
         return None
@@ -73,6 +102,8 @@ def _ledger_allows(target: str, now: _dt.datetime, ttl: int) -> dict | None:
             rows = [json.loads(ln) for ln in fh if ln.strip()]
     except (OSError, ValueError):
         return None
+    used = _consumed_map()
+    mine = os.environ.get("HERMES_DISPATCH_ID") or ""
     for row in reversed(rows):
         if str(row.get("to", "")) != target:
             continue
@@ -80,9 +111,31 @@ def _ledger_allows(target: str, now: _dt.datetime, ttl: int) -> dict | None:
             ts = _dt.datetime.fromisoformat(row["ts"])
         except (KeyError, ValueError):
             continue
-        if abs((now - ts).total_seconds()) <= ttl:
-            return row
+        if abs((now - ts).total_seconds()) > ttl:
+            continue
+        key = _row_key(row)
+        if key in used and used[key] != mine:
+            continue
+        return row
     return None
+
+
+def _row_key(row: dict) -> str:
+    return f"{row.get('ts')}|{row.get('carrier')}|{row.get('to')}"
+
+
+def consume(row: dict) -> None:
+    """Mark a ledger row as used by THIS dispatch (one registration = one dispatch)."""
+    path = os.path.join(_base(), "runtime/dispatch-consumed.jsonl")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    record = {
+        "key": _row_key(row),
+        "at": _dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "disp_id": os.environ.get("HERMES_DISPATCH_ID") or "",
+        "pid": os.getpid(),
+    }
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def _audit(action: str, name: str, detail: str) -> None:
@@ -150,8 +203,9 @@ def evaluate(*, target_home: str | None, caller_home: str | None,
         return None
     row = _ledger_allows(target, now, ttl)
     if row is not None:
+        consume(row)                      # 一登记只授权一次（防 20 分钟窗口被反复使用）
         _audit("dispatch-allow", target,
-               f"A1 放行：派单台账命中 carrier={row.get('carrier')} ts={row.get('ts')} ")
+               f"A1 放行：派单台账命中（已消费）carrier={row.get('carrier')} ts={row.get('ts')}")
         return None
     if os.environ.get("HERMES_DISPATCH_ALLOW") == "1":
         reason = (os.environ.get("HERMES_DISPATCH_ALLOW_REASON") or "").strip()
