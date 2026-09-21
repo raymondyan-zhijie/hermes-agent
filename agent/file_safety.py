@@ -69,108 +69,9 @@ def _resolve_target(path: str) -> Optional[Path]:
     return None
 
 
-def _guard_homes(path: str = "") -> set[str]:
-    """Every home the write guards must cover. Process ``~`` alone is wrong whenever the
-    process HOME is not the OS user's real home — ``TERMINAL_HOME_MODE=profile``,
-    containers, and spawned workers pin ``HOME`` to ``{HERMES_HOME}/home``, which leaves
-    the real home's credential paths unguarded against absolute-path writes while file
-    tools happily write there (and ``_expand_tilde`` may route ``~`` to yet another
-    home). Deny/approval lists are built over the union: process home, real home,
-    subprocess home, and the profile home. A ``~name/...`` input resolves to a named
-    account's home, which joins the set so ``~root/.ssh/authorized_keys`` stays denied."""
-    homes = {os.path.expanduser("~")}
-    with suppress(Exception):
-        from hermes_constants import get_real_home, get_subprocess_home, _profile_home_path
-
-        for candidate in (get_real_home(), get_subprocess_home(), _profile_home_path()):
-            if candidate:
-                homes.add(str(candidate))
-    raw = str(path)
-    if len(raw) > 1 and raw.startswith("~") and raw[1] not in "/\\":
-        name = raw[1:].split("/", 1)[0].split("\\", 1)[0]
-        expanded = os.path.expanduser(f"~{name}")
-        if not expanded.startswith("~"):
-            homes.add(expanded)
-    return {os.path.realpath(h) for h in homes}
-
-
-def _homes_and_resolved(path: str) -> tuple[set[str], str]:
-    """``(guard homes, realpath(expanduser(path)))`` — the write-guard coordinate pair."""
-    return _guard_homes(path), os.path.realpath(os.path.expanduser(str(path)))
-
-
-# ---------------------------------------------------------------------------
-# Windows NT-namespace path guard
-#
-# Pre-approval file accesses reject Windows NT-namespace (``\??\``) paths so
-# the remaining unguarded path touches cannot be turned into an NTLM
-# credential leak.
-#
-# The vector: on Windows, merely *resolving or touching* a path such as
-# ``\\??\\UNC\\attacker.example\\share\\x`` (or the ``\\\\?\\UNC\\`` /
-# ``GLOBALROOT`` re-entry forms) makes the OS initiate SMB authentication to
-# the remote host, leaking the user's NTLM hash — even when the read itself
-# fails or would later be denied. NT object-namespace paths also bypass
-# normal Win32 path normalization, which lets them dodge deny-prefix checks
-# built on ``realpath()`` string comparison. A model tricked by injected
-# content into "reading" such a path leaks credentials before any denylist
-# built on resolved paths can fire.
-#
-# Consequently this check MUST run on the *raw* path string before any
-# ``Path.resolve()`` / ``os.path.realpath()`` call, and it does — it is the
-# first check in both :func:`get_read_block_error` and the write-denial
-# classifier.
-#
-# Scope (deliberately narrow to avoid false positives):
-#   * ``\\??\\...``            — NT object-namespace paths. Never legitimate
-#                                tool input on any platform.
-#   * ``\\\\.\\...``           — Win32 device namespace (``\\\\.\\pipe\\``,
-#                                ``\\\\.\\PhysicalDrive0``, ...). Not a file
-#                                read/write target for agent tools.
-#   * ``\\\\?\\UNC\\...``      — extended-length UNC form (remote host).
-#   * ``\\\\?\\GLOBALROOT...`` — re-entry into the NT namespace.
-#
-# Plain drive-letter extended-length paths (``\\\\?\\C:\\...``) stay ALLOWED:
-# they are a routine local form (see hermes_cli/windows_ssh_runtime.py) and
-# carry no remote-auth trigger. Plain UNC shares (``\\\\server\\share``) are
-# also unchanged here — blocking ordinary UNC reads is a policy question,
-# not part of this namespace-bypass guard.
-#
-# The guard runs on every platform: these prefixes are never legitimate
-# inputs on POSIX either, and path strings can be relayed toward Windows
-# hosts (remote terminal backends, desktop bridges).
-# ---------------------------------------------------------------------------
-
-def is_nt_namespace_path(path: str) -> bool:
-    """Return True if ``path`` is a Windows NT-/device-namespace path.
-
-    Checks the raw string only — never resolves the path (resolving is the
-    credential-leak trigger this guard exists to prevent).
-    """
-    s = str(path).replace("/", "\\")
-    if s.startswith("\\??\\"):
-        return True
-    if s.startswith("\\\\.\\"):
-        return True
-    if s.startswith("\\\\?\\"):
-        rest = s[4:]
-        upper = rest.upper()
-        if upper.startswith("UNC\\") or upper.startswith("GLOBALROOT\\"):
-            return True
-    return False
-
-
-def get_nt_namespace_error(path: str, *, verb: str = "Access") -> Optional[str]:
-    """Return an error message when ``path`` uses the NT/device namespace."""
-    if not is_nt_namespace_path(path):
-        return None
-    return (
-        f"{verb} denied: '{path}' uses a Windows NT/device namespace prefix "
-        "(\\??\\, \\\\.\\, \\\\?\\UNC\\, or GLOBALROOT). These paths bypass "
-        "normal path normalization and can trigger outbound SMB "
-        "authentication (NTLM credential leak) merely by being resolved. "
-        "Use a normal absolute path instead."
-    )
+def _home_and_resolved(path: str) -> tuple[str, str]:
+    """``(realpath(~), realpath(expanduser(path)))`` — the write-guard coordinate pair."""
+    return tuple(os.path.realpath(os.path.expanduser(p)) for p in ("~", str(path)))
 
 
 def build_write_denied_paths(home: str) -> set[str]:
@@ -182,22 +83,11 @@ def build_write_denied_paths(home: str) -> set[str]:
         (".ssh", "authorized_keys"), (".ssh", "id_rsa"), (".ssh", "id_ed25519"),
         (".netrc",), (".pgpass",), (".npmrc",), (".pypirc",), (".git-credentials",),
     )
-    # Secret material under HERMES_HOME, on both the active profile and the global
-    # root: overwriting the root .env leaks credentials across every profile that
-    # inherits it, and the root Anthropic PKCE store is still read by default /
-    # non-profile sessions when a profile is active. google_oauth.json is an OAuth
-    # token store; both Bitwarden caches hold Secrets Manager material.
-    #
-    # auth.json, auth.lock, config.yaml and webhook_subscriptions.json are
-    # deliberately NOT here: #45947 freed those control files on purpose
-    # ("true containment belongs in Docker/remote backends and OS permissions,
-    # not an expanding hardcoded denylist"). They stay read-denied, not write-denied.
-    hermes_files = (
-        ".env", ".anthropic_oauth.json",
-        os.path.join("auth", "google_oauth.json"),
-        os.path.join("cache", "bws_cache.json"),
-        os.path.join("cache", "bws_cache.enc.json"),
-    )
+    # Both the active-profile and top-level copies: overwriting the root .env leaks
+    # credentials across every profile that inherits from it; the root Anthropic
+    # PKCE store is still read by default/non-profile sessions when a profile is
+    # active; bws_cache.enc.json is the Bitwarden Secrets Manager encrypted cache.
+    hermes_files = (".env", ".anthropic_oauth.json", os.path.join("cache", "bws_cache.enc.json"))
     paths = [
         *(os.path.join(home, *f) for f in home_files),
         *(str(base / f) for f in hermes_files for base in (_hermes_home_path(), _hermes_root_path())),
@@ -239,31 +129,21 @@ def build_write_approval_paths(home: str) -> set[str]:
 # HERMES_HOME / root subpaths that the agent's generic file tools must not
 # rewrite. Session transcripts (state.db, sessions/) are application-owned
 # state whose rewrite can falsify history and break resume/compression;
-# mcp-tokens/, pairing/, vault/ (key + ciphertext side by side) and
-# browser-profile/ (copied cookies / Login Data) hold credential material.
-# Control files (auth.json, config.yaml, webhook_subscriptions.json) are
-# deliberately NOT here (#45947): read-denied, but the user may ask to edit them.
-_HERMES_PROTECTED_SUBPATHS = ("state.db", "sessions", "mcp-tokens", "pairing", "vault", "browser-profile")
+# mcp-tokens/ and pairing/ hold credential material.
+_HERMES_PROTECTED_SUBPATHS = ("state.db", "sessions", "mcp-tokens", "pairing")
 
 
 def _classify_write_denial(path: str) -> Optional[str]:
-    """Return ``'credential'``, ``'safe_root'``, ``'nt_namespace'``, or ``None`` if writes are allowed."""
-    # NT/device-namespace check runs on the RAW string, before realpath():
-    # resolving such a path is itself the NTLM-leak trigger, and namespace
-    # prefixes defeat string-prefix denylist comparison after normalization.
-    if is_nt_namespace_path(path):
-        return "nt_namespace"
-    homes, resolved = _homes_and_resolved(path)
+    """Return ``'credential'``, ``'safe_root'``, or ``None`` if writes are allowed."""
+    home, resolved = _home_and_resolved(path)
 
     # Approval-gated paths are allowed at this layer so interactive tools can
     # prompt; checked first so the ``.ssh/`` prefix deny doesn't swallow them.
-    if any(resolved in build_write_approval_paths(home) for home in homes):
+    if resolved in build_write_approval_paths(home):
         return None
 
-    if any(
-        resolved in build_write_denied_paths(home)
-        or any(resolved.startswith(prefix) for prefix in build_write_denied_prefixes(home))
-        for home in homes
+    if resolved in build_write_denied_paths(home) or any(
+        resolved.startswith(prefix) for prefix in build_write_denied_prefixes(home)
     ):
         return "credential"
 
@@ -294,16 +174,48 @@ def get_write_denied_error(path: str, *, verb: str = "Write") -> Optional[str]:
             f"{verb} denied: '{path}' is outside HERMES_WRITE_SAFE_ROOT "
             f"({roots_display}). Unset the variable or add this path's directory prefix."
         )
-    if denial == "nt_namespace":
-        return get_nt_namespace_error(path, verb=verb)
     return f"{verb} denied: '{path}' is a protected system/credential file." if denial else None
 
 
+# ---------------------------------------------------------------------------
+# Governance-protected paths (2026-09-21, fork carry: P2-4 closure).
+#
+# Hermes 四 bot 治理的三区模型里，「生产区」文件（各 profile 的 SOUL.md / config.yaml
+# 与技能 references/）此前**只有 memory 与 skills 走 write_approval 闸门**，
+# 直写不受保护（独立审计 P2-4：漂移窗口最长 24h）。
+# 这里把它们并入既有 approval 闸门：交互式调用者弹审批（once/session/always），
+# 无人类通道的调用者 fail closed。
+# 注意：这是纵深防御而非安全边界 —— 同一 OS 用户仍可经 terminal 绕过。
+# ---------------------------------------------------------------------------
+_GOVERNANCE_BASENAMES = ("SOUL.md", "config.yaml")
+
+
+def _governance_protected(resolved: str, home: str) -> bool:
+    """True 若 ``resolved`` 属治理生产区：根/profile 的 SOUL.md、config.yaml，
+    或任意 ``skills/**/references/**`` 下的文件。"""
+    try:
+        base = os.path.realpath(_hermes_root_path())
+    except Exception:
+        base = os.path.realpath(os.path.join(home, ".hermes"))
+    if not _is_under(resolved, base):
+        return False
+    rel = os.path.relpath(resolved, base).replace(os.sep, "/")
+    parts = rel.split("/")
+    if len(parts) == 1 and parts[0] in _GOVERNANCE_BASENAMES:
+        return True                                   # <root>/SOUL.md | config.yaml
+    if len(parts) == 3 and parts[0] == "profiles" and parts[2] in _GOVERNANCE_BASENAMES:
+        return True                                   # profiles/<p>/SOUL.md | config.yaml
+    if "references" in parts[:-1] and ("skills" in parts):
+        return True                                   # */skills/**/references/<file>
+    return False
+
+
 def is_write_approval_required(path: str) -> bool:
-    """True if ``path`` is approval-gated (``~/.ssh/config``): interactive callers
-    prompt, callers without a channel treat it as a block (fail closed)."""
-    homes, resolved = _homes_and_resolved(path)
-    return any(resolved in build_write_approval_paths(home) for home in homes)
+    """True if ``path`` is approval-gated: ``~/.ssh/config`` (ProxyCommand/Match exec)
+    or a governance-protected production file (SOUL.md / config.yaml / references/**).
+    Interactive callers prompt, callers without a channel treat it as a block (fail closed)."""
+    home, resolved = _home_and_resolved(path)
+    return resolved in build_write_approval_paths(home) or _governance_protected(resolved, home)
 
 
 # Secret-bearing project-local env file basenames, blocked anywhere on disk.
@@ -352,14 +264,6 @@ def get_read_block_error(path: str) -> Optional[str]:
     ``TERMINAL_CWD``) MUST pass an absolute path: ``resolve()`` here anchors at
     the process cwd, so a relative ``"auth.json"`` would miss the denylist.
     """
-    # NT/device-namespace check runs on the RAW string, before resolve():
-    # on Windows, resolving \??\UNC\host\share (or \\?\UNC\, GLOBALROOT)
-    # already triggers outbound SMB auth — the NTLM leak happens before any
-    # resolved-path denylist could fire. Namespace prefixes also bypass
-    # normal path normalization, defeating prefix-comparison denylists.
-    nt_error = get_nt_namespace_error(path, verb="Read")
-    if nt_error:
-        return nt_error
     resolved = Path(path).expanduser().resolve()
     hermes_dirs = _hermes_dirs()
     reason = None
