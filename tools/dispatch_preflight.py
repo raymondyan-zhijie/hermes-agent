@@ -192,14 +192,15 @@ def evaluate(*, target_home: str | None, caller_home: str | None,
         return None
     if target == caller:
         return None
-    if os.environ.get("HERMES_CRON_SESSION"):
-        _audit("dispatch-allow", target, f"A1 放行：cron 内部 spawn target={target}")
-        return None
-    if os.environ.get("HERMES_KANBAN_BOARD"):
-        _audit("dispatch-allow", target, f"A1 放行：kanban worker spawn target={target}")
-        return None
-    if str(source or "").lower() in {"a2a", "kanban"}:
-        _audit("dispatch-allow", target, f"A1 放行：内部 source={source} target={target}")
+    # Internal spawn markers — honoured ONLY together with their own argv signature.
+    # 2026-09-21: a stray ``HERMES_KANBAN_BOARD=default`` in the session environment was
+    # silently allowing EVERY bot-initiated dispatch (found while re-testing A1). An
+    # ambient env var must never be able to disable the gate on its own.
+    # cron needs no rule at all: cron turns run in-process (session ids ``cron_*``) and
+    # never enter this CLI path — verified against the ops cron store.
+    _argv_text = " ".join(argv or [])
+    if os.environ.get("HERMES_KANBAN_BOARD") and "work kanban task" in _argv_text:
+        _audit("dispatch-allow", target, f"A1 放行：kanban worker spawn（argv 签名匹配）target={target}")
         return None
     row = _ledger_allows(target, now, ttl)
     if row is not None:
