@@ -16,6 +16,8 @@ class ProcessCheckpointMixin:
     def _write_checkpoint(self, extra_entries: Optional[List[Dict[str, Any]]] = None):
         """Write running process metadata to the checkpoint file atomically."""
         from tools.process_registry import _checkpoint_path, _CHECKPOINT_FIELDS
+        from tools.process_registry import checkpoint_path_for_profile, profile_from_entry
+        from utils import atomic_json_write
 
         try:
             with self._lock:
@@ -38,8 +40,53 @@ class ProcessCheckpointMixin:
                 if extra_entries:
                     tracked_ids = {item.get("session_id") for item in entries}
                     entries.extend(item for item in extra_entries if item.get("session_id") not in tracked_ids)
-            from utils import atomic_json_write
-            atomic_json_write(_checkpoint_path(), entries)
+                # Group by OWNING profile -- never by the ambient HERMES_HOME at write time:
+                # each profile's file holds only its own entries (P1-e).
+                # Resolve to PATHS before writing: two entries can resolve to the same file
+                # (a stale profile name falls back to this scope's own checkpoint), and writing
+                # that file twice would let the second group clobber the first.
+                # Snapshot -> resolve -> write -> reset all happen under ONE lock on purpose: with
+                # the writes (and the [] resets) outside it, a second thread's snapshot taken
+                # before a process exited could reset the just-written file to [] and silently
+                # drop a live entry.
+                by_path: Dict[Any, List[Dict[str, Any]]] = {}
+                for entry in entries:
+                    path = checkpoint_path_for_profile(profile_from_entry(entry))
+                    by_path.setdefault(path, []).append(entry)
+                # This scope's own file is ALWAYS written, even with zero entries: it must mirror
+                # the live registry, so "everything exited" has to land as [] rather than leaving
+                # the previous snapshot's ghost rows in place forever (the pre-grouping code
+                # rewrote the file unconditionally, which is what kept that invariant).
+                by_path.setdefault(_checkpoint_path(), [])
+                # setdefault keeps the mixin usable standalone (unit tests build it directly)
+                written_paths = self.__dict__.setdefault("_ckpt_files_written", set())
+                written: set = set()
+                for path, items in by_path.items():
+                    try:
+                        atomic_json_write(path, items)
+                    except Exception:
+                        # One unwritable path (a stale profile home, a read-only mount) must not
+                        # abort the rest: the profiles later in this batch would lose their
+                        # checkpoint too and come back orphaned after a restart (that is exactly
+                        # what a single bogus ``profiles/<name>`` path used to do).
+                        logger.warning(
+                            "Failed to write checkpoint to %s (%d entries)", path, len(items),
+                            exc_info=True)
+                        continue
+                    written.add(path)
+                    written_paths.add(path)
+                # A profile whose last process exited must go back to [] -- otherwise its
+                # file keeps ghost rows forever.  Only files this instance wrote are
+                # reset, so unrelated profiles are never touched.
+                for path in list(written_paths):
+                    if path not in written:
+                        try:
+                            atomic_json_write(path, [])
+                        except Exception:
+                            logger.warning("Failed to reset checkpoint file %s", path,
+                                           exc_info=True)
+                            continue
+                        written_paths.discard(path)
         except Exception as e:
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
 
