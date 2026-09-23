@@ -208,8 +208,18 @@ class StatusOutputMixin:
 
     def _flush_status_buffer(self) -> None:
         """Emit buffered retry messages — call on terminal failure so the user sees what was tried."""
-        # The buffered trace already carries the switch line; drop the one-shot notice.
-        self._pending_fallback_notice = None
+        # The buffered trace normally already carries the switch line, so the one-shot notice is
+        # dropped to avoid a stale duplicate later. But when NOTHING was buffered at all the trace
+        # carries nothing: a deterministic refusal (content-policy block / safety refusal) is
+        # terminal on the first attempt — no retries, no fallback — so dropping the notice here is
+        # what left the user with ZERO signal (observed 2026-09-23: upstream 400 "Content Exists
+        # Risk" → turn failed, no chat message, no fallback line, no audit record). Emit it instead.
+        _pending = getattr(self, "_pending_fallback_notice", None)
+        _buf = getattr(self, "_retry_status_buffer", None)
+        if _pending and not _buf:
+            self._emit_pending_fallback_notice()
+        else:
+            self._pending_fallback_notice = None
         buf = getattr(self, "_retry_status_buffer", None)
         if not buf:
             return

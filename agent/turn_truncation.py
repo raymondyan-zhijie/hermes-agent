@@ -669,4 +669,5 @@ def handle_content_policy_refusal(
     return RefusalVerdict("return", _content_policy_blocked_result(
         messages, api_call_count, final_response=_refusal_response,
         error_detail=_refusal_text or "model declined (content_filter)",
+        agent=agent, source="turn_truncation:refusal",
     ), active_system_prompt)
