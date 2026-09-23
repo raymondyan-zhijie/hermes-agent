@@ -87,6 +87,22 @@ def _session_not_ready_error(ret: Any, errcode: Any, errmsg: Any) -> RuntimeErro
         " — the user must send the bot a message first (or re-pair)")
 
 
+def _ilink_error_text(resp: Any) -> Optional[str]:
+    """iLink reports in-band failures as HTTP 200 with ``ret``/``errcode`` != 0.
+
+    Returns a human-readable description of such a failure, or ``None`` when the response is a
+    success. Callers that drop the response on the floor turn a rejection (e.g. ``ret=-2
+    "prepare failed"``) into a phantom success, so every send path must consult this.
+    """
+    if not isinstance(resp, dict):
+        return None
+    ret, errcode = resp.get("ret"), resp.get("errcode")
+    if (ret is None or ret == 0) and (errcode is None or errcode == 0):
+        return None
+    errmsg = resp.get("errmsg") or resp.get("msg") or "unknown error"
+    return f"ret={ret} errcode={errcode} errmsg={errmsg}"
+
+
 def _make_ssl_connector() -> Optional["aiohttp.TCPConnector"]:
     """TCPConnector with certifi's CA bundle (``ilinkai.weixin.qq.com`` fails some system stores, e.g. Homebrew
     OpenSSL); None without certifi so aiohttp's default (honors ``SSL_CERT_FILE`` under trust_env) applies.
@@ -1153,7 +1169,11 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         if caption:
             item_lists.insert(0, [{"type": ITEM_TEXT, "text_item": {"text": self.format_message(caption)}}])
         last_message_id = ""
-        for item_list in item_lists:
+        for index, item_list in enumerate(item_lists):
+            # The caption rides as its own item list ahead of the media. A rejected caption is logged and
+            # skipped — a lost caption is not a lost attachment — while the media item (the last list) stays
+            # fatal: an in-band rejection there must reach SendResult(success=False).
+            is_caption = bool(caption) and index == 0
             last_message_id = f"hermes-weixin-{uuid.uuid4().hex}"
             while True:
                 resp = await _send_items(
@@ -1170,6 +1190,11 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                     logger.warning("[%s] session expired for %s; re-sending media without context_token", self.name, _safe_id(chat_id))
                     continue
                 errmsg = resp.get("errmsg") or resp.get("msg")
+                if is_caption:
+                    logger.warning(
+                        "[%s] caption not delivered to=%s: %s", self.name, _safe_id(chat_id),
+                        _ilink_error_text(resp) or f"ret={ret} errcode={errcode} errmsg={errmsg or 'unknown error'}")
+                    break
                 if _is_stale_session_ret(ret, errcode, errmsg):
                     raise _session_not_ready_error(ret, errcode, errmsg)
                 raise RuntimeError(f"iLink sendmessage error: ret={ret} errcode={errcode} errmsg={errmsg or 'unknown error'}")

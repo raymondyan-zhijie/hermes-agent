@@ -389,8 +389,125 @@ class TestWeixinChunkDelivery:
         assert [call.kwargs["context_token"] for call in send_items_mock.await_args_list] == ["ctx-token", None]
 
 
-class TestWeixinOutboundMedia:
+    @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_prepare_failed_without_context_token_is_not_a_rate_limit(self, send_message_mock, sleep_mock):
+        # A cron / proactive push with no stored context_token cannot take the tokenless
+        # retry, so "prepare failed" used to fall through to the rate-limit arm: a backoff
+        # per chunk plus a cooldown circuit that then fast-fails unrelated sends. It is a
+        # stale session, not a frequency limit — surface it (fail fast, no backoff).
+        adapter = self._connected_adapter()
+        adapter._token_store.get = lambda account_id, chat_id: None
+        adapter._send_chunk_retries = 3
+        adapter._send_chunk_retry_delay_seconds = 0
+        send_message_mock.return_value = {
+            "ret": weixin.RATE_LIMIT_ERRCODE, "errcode": None, "errmsg": "prepare failed",
+        }
 
+        result = asyncio.run(adapter.send("wxid_test123", "first"))
+
+        assert result.success is False
+        # 上游 v0.21.4 同义实现给出的确定性错误（不是 rate limit 文案）
+        assert "session not ready" in (result.error or "")
+        assert "rate limit" not in (result.error or "")
+        assert send_message_mock.await_count == 1
+        assert sleep_mock.await_count == 0
+        assert adapter._rate_limit_circuit_until == 0.0
+
+    @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_prepare_failed_after_tokenless_retry_is_not_a_rate_limit(self, send_message_mock, sleep_mock):
+        # The tokenless retry is the only cure and it is spent after one attempt; a second
+        # "prepare failed" must not be re-filed as a frequency limit.
+        adapter = self._connected_adapter()
+        adapter._send_chunk_retries = 3
+        adapter._send_chunk_retry_delay_seconds = 0
+        send_message_mock.return_value = {
+            "ret": weixin.RATE_LIMIT_ERRCODE, "errcode": None, "errmsg": "prepare failed",
+        }
+
+        result = asyncio.run(adapter.send("wxid_test123", "first"))
+
+        assert result.success is False
+        assert "session not ready" in (result.error or "")
+        assert "rate limit" not in (result.error or "")
+        # 1 tokenful attempt + 1 tokenless retry, then surfaced — no backoff loop.
+        assert send_message_mock.await_count == 2
+        assert sleep_mock.await_count == 0
+        assert adapter._rate_limit_circuit_until == 0.0
+
+
+class _StubCdnUploadSession:
+    """Session stub whose CDN upload POST always succeeds, so tests can drive the *sendmessage* response."""
+
+    def post(self, url, **kwargs):
+        class _Response:
+            status = 200
+            headers = {"x-encrypted-param": "enc-param"}
+
+            async def __aenter__(self_inner):
+                return self_inner
+
+            async def __aexit__(self_inner, exc_type, exc, tb):
+                return False
+
+            async def read(self_inner):
+                return b""
+
+            async def text(self_inner):
+                return ""
+
+        return _Response()
+
+
+class TestWeixinOutboundMedia:
+    @staticmethod
+    def _attached_adapter(tmp_path, name):
+        path = tmp_path / name
+        path.write_bytes(b"fake-bytes")
+        adapter = _make_adapter()
+        adapter._session = adapter._send_session = _StubCdnUploadSession()
+        adapter._token = "test-token"
+        adapter._base_url = "https://weixin.example.com"
+        adapter._cdn_base_url = "https://cdn.example.com/c2c"
+        adapter._token_store.get = lambda account_id, chat_id: None
+        return adapter, path
+
+    def test_send_file_raises_when_ilink_rejects_in_band(self, tmp_path):
+        """HTTP 200 + ret != 0 is a rejection; it must not become a phantom success."""
+        adapter, path = self._attached_adapter(tmp_path, "demo.png")
+
+        with patch("gateway.platforms.weixin._get_upload_url", new=AsyncMock(return_value={"upload_full_url": "https://upload.example.com/media"})), \
+             patch("gateway.platforms.weixin._api_post", new=AsyncMock(return_value={"ret": -2, "errmsg": "prepare failed"})):
+            with pytest.raises(RuntimeError) as excinfo:
+                asyncio.run(adapter._send_file("wxid_test123", str(path), ""))
+
+        assert "ret=-2" in str(excinfo.value)
+        assert "prepare failed" in str(excinfo.value)
+
+    def test_send_document_reports_failure_when_ilink_rejects_in_band(self, tmp_path):
+        """The `hermes send -t weixin` path must return success=False when iLink rejects the file."""
+        adapter, path = self._attached_adapter(tmp_path, "demo.pdf")
+
+        with patch("gateway.platforms.weixin._get_upload_url", new=AsyncMock(return_value={"upload_full_url": "https://upload.example.com/media"})), \
+             patch("gateway.platforms.weixin._api_post", new=AsyncMock(return_value={"ret": -2, "errmsg": "prepare failed"})):
+            result = asyncio.run(adapter.send_document("wxid_test123", str(path)))
+
+        assert result.success is False
+        assert "prepare failed" in (result.error or "")
+
+    def test_rejected_caption_is_logged_but_does_not_sink_the_attachment(self, tmp_path, caplog):
+        """A lost caption is not a lost attachment: warn, keep going, still return the media message id."""
+        adapter, path = self._attached_adapter(tmp_path, "demo.png")
+
+        with patch("gateway.platforms.weixin._get_upload_url", new=AsyncMock(return_value={"upload_full_url": "https://upload.example.com/media"})), \
+             patch("gateway.platforms.weixin._api_post", new=AsyncMock(side_effect=[
+                 {"ret": -2, "errmsg": "prepare failed"}, {"ret": 0}])), \
+             caplog.at_level("WARNING"):
+            message_id = asyncio.run(adapter._send_file("wxid_test123", str(path), "caption text"))
+
+        assert message_id.startswith("hermes-weixin-")
+        assert "caption not delivered" in caplog.text
 
     def test_send_file_uses_post_for_upload_full_url_and_hex_encoded_aes_key(self, tmp_path):
         class _UploadResponse:
@@ -627,6 +744,29 @@ class TestIsStaleSessionRet:
         # -14 is handled by the separate SESSION_EXPIRED_ERRCODE path; the
         # helper only disambiguates -2 from a genuine rate limit.
         assert weixin._is_stale_session_ret(-14, None, "session expired") is False
+
+
+    def test_ret_minus_2_with_unknown_error_is_stale(self):
+        # Expired session (#17228) - the original stale-session errmsg.
+        assert weixin._is_stale_session_ret(-2, None, "unknown error") is True
+
+
+    def test_ret_minus_2_with_prepare_failed_is_stale(self):
+        # A stale context_token reports "prepare failed", not "unknown error".
+        # Cron / proactive pushes hit this whenever no recent inbound message
+        # has refreshed the stored token for that peer. Treating it as a rate
+        # limit skips the tokenless retry that keeps those pushes working.
+        assert weixin._is_stale_session_ret(-2, None, "prepare failed") is True
+
+
+    def test_errcode_minus_2_with_prepare_failed_is_stale(self):
+        # iLink reports the code in errcode on some responses and ret on
+        # others; both spellings must reach the tokenless retry.
+        assert weixin._is_stale_session_ret(None, -2, "prepare failed") is True
+
+
+    def test_stale_session_errmsg_match_is_case_insensitive(self):
+        assert weixin._is_stale_session_ret(-2, None, "Prepare Failed") is True
 
 
 class TestWeixinContentDedup:
