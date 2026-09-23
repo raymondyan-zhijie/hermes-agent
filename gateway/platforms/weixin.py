@@ -65,41 +65,26 @@ _TABLE_RULE_RE = re.compile(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*
 _FENCE_RE = re.compile(r"^```([^\n`]*)\s*$")
 
 
-# ``errmsg`` values that disambiguate a stale session from a genuine frequency limit when iLink answers
-# ret=-2. Both share the same ret, so the message is the only signal.
-#
-# ``unknown error``  — expired session (#17228).
-# ``prepare failed`` — the stored ``context_token`` for the peer has gone stale. Hit by cron / proactive
-#   pushes specifically: the token is only refreshed by an *inbound* message, so an interactive reply
-#   always carries a fresh one while an unprompted push after a quiet period does not. Misfiling this as
-#   a rate limit skips the tokenless retry that exists precisely to keep cron pushes working, and instead
-#   burns the send on a 30s backoff loop until the chunk retries are exhausted.
-_STALE_SESSION_ERRMSGS = frozenset({"unknown error", "prepare failed"})
-
-
 def _is_stale_session_ret(ret: "Optional[int]", errcode: "Optional[int]", errmsg: "Optional[str]") -> bool:
-    """ret/errcode=-2 with a stale-session errmsg is a stale-session signal (like -14), not a real rate limit."""
-    return (ret == RATE_LIMIT_ERRCODE or errcode == RATE_LIMIT_ERRCODE) and (errmsg or "").lower() in _STALE_SESSION_ERRMSGS
+    """Recognize stale-session variants of iLink's ``-2`` response, not real rate limits."""
+    return (ret == RATE_LIMIT_ERRCODE or errcode == RATE_LIMIT_ERRCODE) and (errmsg or "").lower() in {
+        "unknown error",
+        "prepare failed",
+    }
 
 
 def _is_session_expired(resp: Dict[str, Any], ret: Any, errcode: Any) -> bool:
-    return SESSION_EXPIRED_ERRCODE in (ret, errcode) or _is_stale_session_ret(ret, errcode, resp.get("errmsg"))
+    return SESSION_EXPIRED_ERRCODE in (ret, errcode) or _is_stale_session_ret(ret, errcode, resp.get("errmsg") or resp.get("msg"))
 
 
-def _ilink_error_text(resp: Any) -> Optional[str]:
-    """iLink reports in-band failures as HTTP 200 with ``ret``/``errcode`` != 0.
-
-    Returns a human-readable description of such a failure, or ``None`` when the response is a
-    success. Callers that drop the response on the floor turn a rejection (e.g. ``ret=-2
-    "prepare failed"``) into a phantom success, so every send path must consult this.
-    """
-    if not isinstance(resp, dict):
-        return None
-    ret, errcode = resp.get("ret"), resp.get("errcode")
-    if (ret is None or ret == 0) and (errcode is None or errcode == 0):
-        return None
-    errmsg = resp.get("errmsg") or resp.get("msg") or "unknown error"
-    return f"ret={ret} errcode={errcode} errmsg={errmsg}"
+def _session_not_ready_error(ret: Any, errcode: Any, errmsg: Any) -> RuntimeError:
+    """The stale-session ``-2`` after the tokenless re-send is exhausted (or with no token to drop): iLink will not
+    prepare a bot-initiated send until this peer messages the bot again. Deterministic, so it is neither retried nor
+    fed to the rate-limit breaker (#80125). The text must not contain "rate limit" — ``classify_send_error`` would
+    route it back into the rate-limited redelivery lane."""
+    return RuntimeError(
+        f"iLink sendmessage session not ready: ret={ret} errcode={errcode} errmsg={errmsg or 'unknown error'}"
+        " — the user must send the bot a message first (or re-pair)")
 
 
 def _make_ssl_connector() -> Optional["aiohttp.TCPConnector"]:
@@ -740,23 +725,12 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         self._group_allow_from = self._coerce_list(_wx_secret("WEIXIN_GROUP_ALLOWED_USERS", "") if group_allow_from is None else group_allow_from)
         self._split_multiline_messages = _coerce_bool(_extra_or_secret(extra, "split_multiline_messages", ""), default=False)
         # Text debounce batching (Telegram pattern): iLink delivers messages individually, so rapid bursts would each
-        # trigger a separate agent run. 3s / 5s (after a ~2048-char split chunk) suit iLink's cadence.
-        self._text_batch_delay_seconds = self._coerce_float_extra("text_batch_delay_seconds", 3.0)
-        self._text_batch_split_delay_seconds = self._coerce_float_extra("text_batch_split_delay_seconds", 5.0)
+        # trigger a separate agent run. Telegram cadence and ceilings (#44883); ``0`` dispatches immediately.
+        self._configure_text_batch_delays()
         persisted = load_weixin_account(hermes_home, self._account_id) if self._account_id and not self._token else None
         if persisted:
             self._token = str(persisted.get("token") or "").strip()
             self._base_url = str(persisted.get("base_url") or self._base_url).strip().rstrip("/")
-
-    def _coerce_float_extra(self, key: str, default: float) -> float:
-        """Float from ``config.extra``; fed to ``asyncio.sleep()``, so NaN/Inf/negative/unparseable → default."""
-        import math
-        value = (self.config.extra or {}).get(key)
-        try:
-            parsed = float(value) if value is not None else float(default)
-        except (TypeError, ValueError):
-            return float(default)
-        return parsed if math.isfinite(parsed) and parsed >= 0 else float(default)
 
     @staticmethod
     def _coerce_list(value: Any) -> List[str]:
@@ -916,30 +890,6 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             ref_item = (item.get("ref_msg") or {}).get("message_item")
             for candidate in (item, ref_item) if isinstance(ref_item, dict) else (item,):
                 await self._collect_media(candidate, media_paths, media_types)
-
-        # Auto-vision: if main model doesn't support images natively (e.g.
-        # MiniMax-M3 in models_dev_cache has attachment: false), the LLM
-        # receives an empty text and the image is silently dropped. Detect
-        # this case and prepend a vision-analyze description to text so the
-        # LLM at least knows what the user sent. Wrapped in try/except so a
-        # vision failure never blocks the message path.
-        if media_paths and not text:
-            # Only pre-analyze with vision_analyze when the main model can't
-            # see images natively. When decide=native, base.py inlines the
-            # image and the main model sees it directly — no text pre-analysis
-            # needed (and the aux vision path can't build an OAuth client for
-            # minimax-oauth anyway). #vision-native
-            try:
-                from agent.image_routing import decide_image_input_mode
-                from agent.auxiliary_client import _read_main_provider, _read_main_model
-                from hermes_cli.config import load_config as _load_cfg
-                _wx_img_mode = decide_image_input_mode(
-                    _read_main_provider(), _read_main_model(), _load_cfg())
-            except Exception:
-                _wx_img_mode = "text"
-            if _wx_img_mode != "native":
-                text = await self._maybe_attach_vision_descriptions(media_paths, media_types)
-
         if not text and not media_paths:
             return
         source = self.build_source(chat_id=effective_chat_id, chat_type=chat_type, user_id=sender_id, user_name=sender_id)
@@ -952,64 +902,12 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         else:
             await self.handle_message(event)
 
-    def _text_batch_key(self, event: MessageEvent) -> str:
-        from gateway.session import build_session_key
-        return build_session_key(
-            event.source, group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False), profile=event.source.profile)
-
     async def _collect_media(self, item: Dict[str, Any], media_paths: List[str], media_types: List[str]) -> None:
         spec = _INBOUND_MEDIA.get(item.get("type"))
         path, mime = await self._download_media(item, spec) if spec else (None, "")
         if path:
             media_paths.append(path)
             media_types.append(mime)
-
-    async def _maybe_attach_vision_descriptions(
-        self, media_paths: List[str], media_types: List[str]
-    ) -> str:
-        """Run vision_analyze_tool on inbound images when the main model can't see them.
-
-        Only triggers for image MIME types. Returns a Chinese-language prefix
-        that can be prepended to the user text. Never raises — a vision failure
-        becomes a placeholder so the LLM still gets a non-empty message.
-        """
-        prompts: List[str] = []
-        for path, mime in zip(media_paths, media_types):
-            if not (mime or "").startswith("image/"):
-                continue
-            if not (path and os.path.isfile(path)):
-                continue
-            try:
-                from tools.vision_tools import vision_analyze_tool
-
-                prompt = (
-                    "请详细描述这张图片里所有产品的外观、型号、屏幕显示内容、按键、接口、配件。"
-                )
-                # 60s cap per image; this runs in the inbound event loop.
-                result = await asyncio.wait_for(
-                    vision_analyze_tool(path, prompt, model="MiniMax-M3"),
-                    timeout=60.0,
-                )
-                try:
-                    parsed = json.loads(result) if isinstance(result, str) else result
-                    description = (parsed or {}).get("analysis") or ""
-                except Exception:
-                    description = str(result) if result else ""
-                if description and not description.startswith("There was a problem"):
-                    prompts.append(f"[图片 {os.path.basename(path)} 的视觉分析]\n{description}")
-                else:
-                    prompts.append(f"[用户发了一张图:{os.path.basename(path)},视觉分析失败,请让用户口述]")
-            except asyncio.TimeoutError:
-                logger.warning("[%s] vision analyze timeout for %s", self.name, path)
-                prompts.append(f"[用户发了一张图:{os.path.basename(path)},视觉分析超时]")
-            except Exception as exc:
-                logger.warning("[%s] vision analyze failed for %s: %s", self.name, path, exc)
-                prompts.append(f"[用户发了一张图:{os.path.basename(path)},视觉分析失败,请让用户口述]")
-
-        if not prompts:
-            return ""
-        return "\n\n".join(prompts) + "\n\n请基于以上图片内容回应用户。"
 
     async def _download_media(self, item: Dict[str, Any], spec: Tuple[Any, ...]) -> Tuple[Optional[str], str]:
         """Download + decrypt one inbound media item -> (cached path or None, mime). Voice is always downloaded
@@ -1063,13 +961,15 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         return self._rate_limit_cooldown_remaining() > 0
 
     async def _send_text_chunk(self, *, chat_id: str, chunk: str, context_token: Optional[str], client_id: str) -> None:
-        """Send one text chunk with retry/backoff under the adapter-wide text gate. On session-expired (errcode -14)
-        retry once *without* ``context_token`` — iLink accepts tokenless sends as a degraded fallback, which keeps cron
-        pushes working when no user message refreshed the session."""
+        """Send one text chunk with retry/backoff under the adapter-wide text gate. A stale-session response (``-14``,
+        or ``-2`` with ``prepare failed``/``unknown error``) is re-sent once *without* ``context_token`` — iLink accepts
+        tokenless sends as a degraded fallback, which keeps cron pushes working when no user message refreshed the
+        session. A ``-2`` that survives that fails fast via ``_session_not_ready_error``."""
         async with self._send_text_gate:
             last_error: Optional[Exception] = None
             retried_without_token = False
-            for attempt in range(self._send_chunk_retries + 1):
+            attempt = 0  # counts real failures only — the tokenless re-send must not eat the retry budget
+            while True:
                 if self._rate_limit_cooldown_remaining() > 0:
                     raise RuntimeError(f"iLink sendmessage rate limited; cooldown active for {self._rate_limit_cooldown_remaining():.1f}s")
                 try:
@@ -1078,37 +978,28 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                         context_token=context_token, client_id=client_id)
                     ret, errcode = (resp.get("ret"), resp.get("errcode")) if resp and isinstance(resp, dict) else (None, None)
                     if (ret is not None and ret != 0) or (errcode is not None and errcode != 0):
+                        errmsg = resp.get("errmsg") or resp.get("msg")
                         if _is_session_expired(resp, ret, errcode) and not retried_without_token and context_token:
                             retried_without_token, context_token = True, None
                             self._token_store._cache.pop(self._token_store._key(self._account_id, chat_id), None)
                             logger.warning("[%s] session expired for %s; retrying without context_token", self.name, _safe_id(chat_id))
                             continue
-                        errmsg = resp.get("errmsg") or resp.get("msg")
+                        if _is_stale_session_ret(ret, errcode, errmsg):
+                            # break, not raise: a raise here is caught below and re-enters the retry ladder.
+                            last_error = _session_not_ready_error(ret, errcode, errmsg)
+                            break
                         if ret != RATE_LIMIT_ERRCODE and errcode != RATE_LIMIT_ERRCODE:
                             raise RuntimeError(f"iLink sendmessage error: ret={ret} errcode={errcode} errmsg={errmsg or 'unknown error'}")
-                        if _is_stale_session_ret(ret, errcode, errmsg):
-                            # ret=-2 with a stale-session errmsg is NOT a frequency limit, so the
-                            # rate-limit arm below is the wrong medicine: it burns a backoff per chunk
-                            # and can trip the adapter-wide cooldown circuit, which then fast-fails
-                            # unrelated sends. The tokenless retry above is the only cure, and by this
-                            # point it is spent — either already attempted, or never available because
-                            # the send carried no context_token (the cron / proactive-push case).
-                            _spent = ("already attempted" if retried_without_token
-                                      else "unavailable (no context_token)")
-                            # break, not raise: the generic except-arm below would otherwise
-                            # retry the chunk against the same dead session for nothing.
-                            last_error = RuntimeError(
-                                f"iLink sendmessage stale session: ret={ret} errcode={errcode} "
-                                f"errmsg={errmsg or 'stale session'}; tokenless retry {_spent}")
-                            break
                         # Keep a descriptive error for when the loop exhausts while still limited.
                         last_error = RuntimeError(f"iLink sendmessage rate limited: ret={ret} errcode={errcode} errmsg={errmsg or 'rate limited'}")
                         if self._record_rate_limit_event():
                             last_error = RuntimeError(
-                                f"iLink sendmessage rate limited; cooldown active for {self._rate_limit_cooldown_remaining():.1f}s")
+                                f"iLink sendmessage rate limited (ret={ret} errcode={errcode} errmsg={errmsg or 'rate limited'}); "
+                                f"cooldown active for {self._rate_limit_cooldown_remaining():.1f}s")
                             break
                         if attempt >= self._send_chunk_retries:
                             break
+                        attempt += 1
                         wait = self._send_chunk_retry_delay_seconds * 3  # 3x backoff for rate limit
                         logger.warning("[%s] rate limited for %s; backing off %.1fs before retry", self.name, _safe_id(chat_id), wait)
                         await asyncio.sleep(wait)
@@ -1120,9 +1011,10 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                     last_error = exc
                     if attempt >= self._send_chunk_retries:
                         break
-                    wait = self._send_chunk_retry_delay_seconds * (attempt + 1)
+                    attempt += 1
+                    wait = self._send_chunk_retry_delay_seconds * attempt
                     logger.warning("[%s] send chunk failed to=%s attempt=%d/%d, retrying in %.2fs: %s",
-                                   self.name, _safe_id(chat_id), attempt + 1, self._send_chunk_retries + 1, wait, exc)
+                                   self.name, _safe_id(chat_id), attempt, self._send_chunk_retries + 1, wait, exc)
                     if wait > 0:
                         await asyncio.sleep(wait)
             assert last_error is not None
@@ -1219,9 +1111,9 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
     async def send_video(self, chat_id: str, video_path: str, caption: Optional[str] = None, reply_to=None, metadata=None) -> SendResult:
         return await self._send_file_result(chat_id, video_path, caption or "", "send_video")
 
-    async def send_voice(self, chat_id: str, audio_path: str, caption: Optional[str] = None, reply_to=None, metadata=None) -> SendResult:
+    async def send_voice(self, chat_id: str, audio_path: str, caption: Optional[str] = None, reply_to=None, metadata=None, **kwargs) -> SendResult:
         # Native outbound voice bubbles are not proven-working upstream; a file attachment at least plays (even .silk).
-        return await self._send_file_result(chat_id, audio_path, caption or "[voice message as attachment]", "send_voice", force_file_attachment=True)
+        return await self._send_file_result(chat_id, audio_path, caption or self.warning_text("[voice message as attachment]"), "send_voice", force_file_attachment=True)
 
     async def _download_remote_media(self, url: str) -> str:
         from tools.url_safety import is_safe_url
@@ -1257,25 +1149,30 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             "ciphertext_size": len(ciphertext), "plaintext_size": rawsize, "filename": Path(path).name, "rawfilemd5": rawfilemd5}
         if media_type == MEDIA_VOICE and path.endswith(".silk"):
             item_kwargs.update(encode_type=6, sample_rate=24000, bits_per_sample=16)
+        item_lists: List[List[Dict[str, Any]]] = [[item_builder(**item_kwargs)]]
         if caption:
-            caption_response = await _send_message(
-                self._send_session, base_url=self._base_url, token=self._token, to=chat_id, text=self.format_message(caption),
-                context_token=context_token, client_id=f"hermes-weixin-{uuid.uuid4().hex}")
-            # An iLink reject here is HTTP 200 + ret != 0, so it is logged rather than silently
-            # dropped. It stays non-fatal: a lost caption does not mean the attachment was lost.
-            caption_error = _ilink_error_text(caption_response)
-            if caption_error:
-                logger.warning("[%s] caption not delivered to=%s: %s", self.name, _safe_id(chat_id), caption_error)
-        last_message_id = f"hermes-weixin-{uuid.uuid4().hex}"
-        response = await _send_items(
-            self._send_session, base_url=self._base_url, token=self._token, to=chat_id, item_list=[item_builder(**item_kwargs)],
-            context_token=context_token, client_id=last_message_id)
-        # Raise on an in-band iLink rejection so the failure reaches SendResult(success=False).
-        # Ignoring this response is what made `hermes send -t weixin "MEDIA:…"` print "Sent"
-        # while nothing was delivered ("发送了 ≠ 发送成功" at the code level).
-        media_error = _ilink_error_text(response)
-        if media_error:
-            raise RuntimeError(f"iLink sendmessage (media) failed to={_safe_id(chat_id)}: {media_error}")
+            item_lists.insert(0, [{"type": ITEM_TEXT, "text_item": {"text": self.format_message(caption)}}])
+        last_message_id = ""
+        for item_list in item_lists:
+            last_message_id = f"hermes-weixin-{uuid.uuid4().hex}"
+            while True:
+                resp = await _send_items(
+                    self._send_session, base_url=self._base_url, token=self._token, to=chat_id, item_list=item_list,
+                    context_token=context_token, client_id=last_message_id)
+                ret, errcode = (resp.get("ret"), resp.get("errcode")) if resp and isinstance(resp, dict) else (None, None)
+                if (ret is None or ret == 0) and (errcode is None or errcode == 0):
+                    break
+                # Same stale-session fallback as _send_text_chunk: re-send once without context_token. Clearing the
+                # token also covers the remaining item lists (caption, then media) and bounds this loop.
+                if _is_session_expired(resp, ret, errcode) and context_token:
+                    context_token = None
+                    self._token_store._cache.pop(self._token_store._key(self._account_id, chat_id), None)
+                    logger.warning("[%s] session expired for %s; re-sending media without context_token", self.name, _safe_id(chat_id))
+                    continue
+                errmsg = resp.get("errmsg") or resp.get("msg")
+                if _is_stale_session_ret(ret, errcode, errmsg):
+                    raise _session_not_ready_error(ret, errcode, errmsg)
+                raise RuntimeError(f"iLink sendmessage error: ret={ret} errcode={errcode} errmsg={errmsg or 'unknown error'}")
         return last_message_id
 
     def _outbound_media_builder(self, path: str, force_file_attachment: bool = False):
