@@ -984,7 +984,7 @@ def _note_content_policy_blocked(agent, error_detail: str, *, source: str) -> No
 
     1. ``_buffer_fallback_notice`` — the one-shot notice channel that is proven to reach the chat
        (same mechanism as "⚠️ Model fallback: ..."); it is emitted at turn end.
-    2. ``logs/content-policy-events.jsonl`` — one JSON line per block, profile-scoped, so blocks
+    2. ``runtime/content-policy-events.jsonl`` — one JSON line per block, profile-scoped, so blocks
        are auditable after the fact (which provider/model refused, what the provider said).
 
     Never raises: observability must not break the failure path.
@@ -1011,7 +1011,7 @@ def _note_content_policy_blocked(agent, error_detail: str, *, source: str) -> No
 
         from hermes_constants import get_hermes_home
 
-        path = _os.path.join(str(get_hermes_home()), "logs", "content-policy-events.jsonl")
+        path = _os.path.join(str(get_hermes_home()), "runtime", "content-policy-events.jsonl")
         _os.makedirs(_os.path.dirname(path), exist_ok=True)
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(_json.dumps({

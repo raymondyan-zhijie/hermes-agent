@@ -4,7 +4,7 @@ A provider safety-filter refusal is terminal on the first attempt (``retryable=F
 credentials unchanged), and the retry buffer is empty on that path -- so the status flush at
 turn end used to discard the pending one-shot notice, and the turn carried no record at all.
 Two sinks are pinned here: the notice channel that is proven to reach the chat, and the
-profile-scoped ``logs/content-policy-events.jsonl`` audit line.
+profile-scoped ``runtime/content-policy-events.jsonl`` audit line.
 
 Ported (2026-09-23) from the authoring copy at
 ``work/cu-contentpolicy-20260923/test_cu_content_policy_notice.py``: that file lived in the
@@ -85,7 +85,7 @@ def test_content_policy_result_notifies_the_user_and_records_the_block(tmp_path,
     assert notice and "Content policy blocked" in str(notice)
     assert "deepseek" in str(notice) and "Content Exists Risk" in str(notice)
 
-    path = pathlib.Path(tmp_path) / "logs" / "content-policy-events.jsonl"
+    path = pathlib.Path(tmp_path) / "runtime" / "content-policy-events.jsonl"
     assert path.exists(), "a content-policy terminal must leave an auditable record"
     rec = json.loads(path.read_text(encoding="utf-8").strip().splitlines()[-1])
     assert rec["event"] == "content_policy_blocked"
@@ -104,7 +104,7 @@ def test_result_without_an_agent_stays_silent(tmp_path, monkeypatch):
         [], 1, final_response="⚠️ blocked", error_detail="d")
 
     assert res["failed"] is True and res["failure_reason"] == "content_policy_blocked"
-    assert not (pathlib.Path(tmp_path) / "logs" / "content-policy-events.jsonl").exists()
+    assert not (pathlib.Path(tmp_path) / "runtime" / "content-policy-events.jsonl").exists()
 
 
 def test_note_never_raises_on_a_hostile_agent(tmp_path, monkeypatch):
