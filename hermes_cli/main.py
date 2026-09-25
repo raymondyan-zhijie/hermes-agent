@@ -39,6 +39,20 @@ import re
 import sys
 import uuid
 
+# A1 (fork carry#16, 2026-09-21): remember where this process was launched FROM,
+# BEFORE _apply_profile_override() rewrites HERMES_HOME to the *target* profile (the
+# override runs on -p/--profile and the CLI may then re-exec itself, so a capture
+# taken afterwards would already read the target). setdefault: the outermost caller
+# wins, so nested spawns keep the origin.
+os.environ.setdefault(
+    "HERMES_DISPATCH_CALLER_HOME",
+    os.environ.get("HERMES_HOME") or os.environ.get("HERMES_SESSION_PROFILE") or "",
+)
+# Identity of THIS dispatch attempt. Minted once and inherited across the CLI's re-exec,
+# so the second evaluation (and the ledger-row consumption) belong to the same dispatch.
+os.environ.setdefault("HERMES_DISPATCH_ID", uuid.uuid4().hex)
+
+
 # Inline path math so ``python hermes_cli/main.py`` (script mode: sys.path[0]
 # is hermes_cli/, not the repo root) can import hermes_cli._startup_fast.
 _bootstrap_root = os.path.realpath(os.path.join(os.path.dirname(__file__), os.pardir))
@@ -649,19 +663,6 @@ def _apply_profile_override() -> None:
         sys.argv = sys.argv[:start] + sys.argv[start + consume :]
 
 
-# A1 (fork carry#16, 2026-09-21): remember where this process was launched FROM,
-# BEFORE _apply_profile_override() rewrites HERMES_HOME to the *target* profile (the
-# override runs on -p/--profile and the CLI may then re-exec itself, so a capture
-# taken afterwards would already read the target). setdefault: the outermost caller
-# wins, so nested spawns keep the origin.
-os.environ.setdefault(
-    "HERMES_DISPATCH_CALLER_HOME",
-    os.environ.get("HERMES_HOME") or os.environ.get("HERMES_SESSION_PROFILE") or "",
-)
-# Identity of THIS dispatch attempt. Minted once and inherited across the CLI's re-exec,
-# so the second evaluation (and the ledger-row consumption) belong to the same dispatch.
-os.environ.setdefault("HERMES_DISPATCH_ID", uuid.uuid4().hex)
-
 _apply_profile_override()
 # ``-p``/active_profile re-homed the process after hermes_bootstrap ran: re-point the temp vars
 # at THIS home's scratch dir (a user-set TMPDIR is still left alone).
@@ -671,44 +672,6 @@ try:
     _export_scratch_tmp_env()
 except Exception:
     pass  # an unwritable home leaves the system temp dir in place; never block startup
-
-
-def _a1_dispatch_guard_oneshot() -> None:
-    """A1 (fork carry#16): refuse a cross-profile oneshot dispatch that skipped the wrapper.
-
-    Runs ONCE per process, at import time, so it covers every launch path (the fast
-    chat/termux launchers, ``_run_oneshot_from_args`` and ``cmd_chat``) instead of
-    needing a hook in each. Only fires when argv looks like a non-interactive query.
-    """
-    if os.environ.get("HERMES_DISPATCH_DEBUG"):
-        print(f"[a1-main] 守卫被调用 pid={os.getpid()} argv={sys.argv[1:]}", file=sys.stderr)
-    if os.environ.get("HERMES_DISPATCH_GUARDED") == "1":
-        if os.environ.get("HERMES_DISPATCH_DEBUG"):
-            print("[a1-main] 已守卫过，跳过", file=sys.stderr)
-        return
-    # Never fire inside a test runner / embedded use: ``pytest -q`` carries the same
-    # ``-q`` token but is not a dispatch.
-    if os.environ.get("PYTEST_CURRENT_TEST") or "pytest" in os.path.basename(sys.argv[0] or ""):
-        return
-    argv = list(sys.argv[1:])
-    if not any(
-        a in {"-q", "--query", "-z", "--oneshot"}
-        or a.startswith("--query=")
-        or a.startswith("--oneshot=")
-        for a in argv
-    ):
-        return
-    source = None
-    for i, a in enumerate(argv):
-        if a == "--source" and i + 1 < len(argv):
-            source = argv[i + 1]
-    os.environ["HERMES_DISPATCH_GUARDED"] = "1"
-    from tools.dispatch_preflight import guard_dispatch
-
-    guard_dispatch(source=source, argv=argv)
-
-
-_a1_dispatch_guard_oneshot()
 
 # Windows launcher self-heal — the ``hermes`` command is a COPY of the venv
 # console script staged into the managed bin dir (outside the checkout, since
@@ -3713,3 +3676,42 @@ def __getattr__(name):  # PEP 562 — chained onto the module's own __getattr__
     warn_once(__name__, name, *target)
     return getattr(importlib.import_module(target[0]), target[1])
 # ---- END PLUGIN-COMPAT ----
+
+# A1 (fork carry#16): import-time dispatch guard lives at module end so it never
+# collides with upstream's _apply_profile_override()/pm insertion hotspot.
+def _a1_dispatch_guard_oneshot() -> None:
+    """A1 (fork carry#16): refuse a cross-profile oneshot dispatch that skipped the wrapper.
+
+    Runs ONCE per process, at import time, so it covers every launch path (the fast
+    chat/termux launchers, ``_run_oneshot_from_args`` and ``cmd_chat``) instead of
+    needing a hook in each. Only fires when argv looks like a non-interactive query.
+    """
+    if os.environ.get("HERMES_DISPATCH_DEBUG"):
+        print(f"[a1-main] 守卫被调用 pid={os.getpid()} argv={sys.argv[1:]}", file=sys.stderr)
+    if os.environ.get("HERMES_DISPATCH_GUARDED") == "1":
+        if os.environ.get("HERMES_DISPATCH_DEBUG"):
+            print("[a1-main] 已守卫过，跳过", file=sys.stderr)
+        return
+    # Never fire inside a test runner / embedded use: ``pytest -q`` carries the same
+    # ``-q`` token but is not a dispatch.
+    if os.environ.get("PYTEST_CURRENT_TEST") or "pytest" in os.path.basename(sys.argv[0] or ""):
+        return
+    argv = list(sys.argv[1:])
+    if not any(
+        a in {"-q", "--query", "-z", "--oneshot"}
+        or a.startswith("--query=")
+        or a.startswith("--oneshot=")
+        for a in argv
+    ):
+        return
+    source = None
+    for i, a in enumerate(argv):
+        if a == "--source" and i + 1 < len(argv):
+            source = argv[i + 1]
+    os.environ["HERMES_DISPATCH_GUARDED"] = "1"
+    from tools.dispatch_preflight import guard_dispatch
+
+    guard_dispatch(source=source, argv=argv)
+
+
+_a1_dispatch_guard_oneshot()
