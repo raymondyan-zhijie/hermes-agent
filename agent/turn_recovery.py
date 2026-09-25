@@ -1025,7 +1025,6 @@ def nonretryable_client_error_result(
             messages, api_call_count,
             final_response="⚠️ " + content_policy_copy(label=_plabel, summary=_nonretryable_summary),
             error_detail=_nonretryable_summary,
-            agent=agent, source="turn_recovery:http_error",
         )
     # Billing walls get the same structured recovery descriptor as the max-retries path
     # so every surface renders one consistent signal.

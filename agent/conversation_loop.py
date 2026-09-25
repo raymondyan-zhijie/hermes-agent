@@ -984,50 +984,11 @@ def _invalid_tool_name_error_content(name: str, valid_tool_names) -> str:
     return f"Tool '{name}' does not exist. Available tools: {available}"
 
 
-def _note_content_policy_blocked(agent, error_detail: str, *, source: str) -> None:
-    """Surface a content-policy block to the user (single sink; audit lives out-of-tree).
-
-    2026-09-23 (owner-approved "CU: 要"): a provider safety-filter refusal is terminal on the
-    first attempt (``retryable=False``, credentials unchanged), so the turn carried **no visible
-    signal at all** — evidence: research profile 13:08, upstream 400 ``Content Exists Risk`` →
-    ``API call failed (attempt 1/3, not retryable)``, zero messages persisted in that window,
-    zero ``Model fallback`` lines. One sink:
-
-    1. ``_buffer_fallback_notice`` — the one-shot notice channel that is proven to reach the chat
-       (same mechanism as "⚠️ Model fallback: ..."); it is emitted at turn end.
-
-    The audit record is NOT written here any more (2026-09-25): the host's ``risk-degrade-notice``
-    plugin logs every provider content-policy refusal to ``runtime/risk-degrade-events.jsonl`` from
-    the ``api_request_error`` hook (provider / model / status_code / reason / error_message /
-    session_id / platform), so that record has a single writer and stays out of the core tree.
-
-    Never raises: observability must not break the failure path.
-    """
-    model = str(getattr(agent, "model", "?") or "?")
-    provider = str(getattr(agent, "provider", "?") or "?")
-    detail = (error_detail or "").strip()
-    if len(detail) > 300:
-        detail = detail[:300] + "..."
-    try:
-        from agent.chat_completion_helpers import _buffer_fallback_notice
-
-        _buffer_fallback_notice(agent, (
-            f"⚠️ Content policy blocked: {provider}/{model} refused this prompt "
-            f"(provider safety filter, not retried, credentials unchanged). "
-            f"Rephrase the request or switch models with /model. Provider said: {detail or 'n/a'}"
-        ))
-    except Exception:  # noqa: BLE001 — never break the failure path
-        logger.debug("content-policy notice buffering failed", exc_info=True)
-
-
 def _content_policy_blocked_result(
-    messages: List[Dict], api_call_count: int, *, final_response: str, error_detail: str,
-    agent: Any = None, source: str = "turn_recovery",
+    messages: List[Dict], api_call_count: int, *, final_response: str, error_detail: str
 ) -> Dict[str, Any]:
     """Terminal turn result for a content-policy block (deterministic for the unchanged
     prompt, so no retry); shared by the HTTP-200 and exception paths."""
-    if agent is not None:
-        _note_content_policy_blocked(agent, error_detail, source=source)
     return {
         "final_response": final_response, "messages": messages, "api_calls": api_call_count,
         "completed": False, "failed": True, "error": f"content_policy_blocked: {error_detail}",
