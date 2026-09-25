@@ -353,19 +353,12 @@ def _check_approval_required_write(paths: list[str], task_id: str = "default") -
         return None
 
     display_targets = ", ".join(dict.fromkeys(targets))
-    _is_ssh = any(p.endswith("/.ssh/config") or p.endswith(".ssh/config") for p in targets)
-    if _is_ssh:
-        _what = "SSH client config file(s)"
-        _why_desc = ("The SSH config can carry ProxyCommand / Match exec directives that "
-                     "run commands, so writes require your approval.")
-    else:
-        # 2026-09-21 fork carry（P2-4 收口）：SOUL.md / config.yaml / references/** 属治理生产区
-        _what = "governance-protected production file(s)"
-        _why_desc = ("SOUL.md / config.yaml / references/ define each bot's rules and the shared "
-                     "governance text, so writes require your approval.")
-    description = f"Write to {_what}: {display_targets}. {_why_desc}"
+    description = (
+        f"Write to SSH client config file(s): {display_targets}. "
+        "The SSH config can carry ProxyCommand / Match exec directives that "
+        "run commands, so writes require your approval.")
     blocked = (
-        f"BLOCKED: write to {_what} ({display_targets}) "
+        f"BLOCKED: write to SSH config file(s) ({display_targets}) "
         "{why} Do NOT retry it via another path (terminal, execute_code) "
         "without the user's explicit consent.")
 

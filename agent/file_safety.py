@@ -299,47 +299,11 @@ def get_write_denied_error(path: str, *, verb: str = "Write") -> Optional[str]:
     return f"{verb} denied: '{path}' is a protected system/credential file." if denial else None
 
 
-# ---------------------------------------------------------------------------
-# Governance-protected paths (2026-09-21 fork carry: P2-4 closure; 2026-09-22
-# re-applied onto the upstream rewrite of this module).
-#
-# Hermes 四 bot 治理的三区模型里，「生产区」文件（各 profile 的 SOUL.md / config.yaml
-# 与技能 references/）此前只有 memory 与 skills 走 write_approval 闸门，
-# 直写不受保护（独立审计 P2-4：漂移窗口最长 24h）。这里把它们并入既有 approval 闸门：
-# 交互式调用者弹审批（once/session/always），无人类通道的调用者 fail closed。
-# 注意：这是纵深防御而非安全边界 —— 同一 OS 用户仍可经 terminal 绕过。
-# ---------------------------------------------------------------------------
-_GOVERNANCE_BASENAMES = ("SOUL.md", "config.yaml")
-
-
-def _governance_protected(resolved: str, home: str) -> bool:
-    """True 若 ``resolved`` 属治理生产区：根/profile 的 SOUL.md、config.yaml，
-    或任意 ``skills/**/references/**`` 下的文件。"""
-    try:
-        base = os.path.realpath(_hermes_root_path())
-    except Exception:
-        base = os.path.realpath(home)
-    if not _is_under(resolved, base):
-        return False
-    rel = os.path.relpath(resolved, base).replace(os.sep, "/")
-    parts = rel.split("/")
-    if len(parts) == 1 and parts[0] in _GOVERNANCE_BASENAMES:
-        return True                                   # <root>/SOUL.md | config.yaml
-    if len(parts) == 3 and parts[0] == "profiles" and parts[2] in _GOVERNANCE_BASENAMES:
-        return True                                   # profiles/<p>/SOUL.md | config.yaml
-    if "references" in parts[:-1] and "skills" in parts:
-        return True                                   # */skills/**/references/<file>
-    return False
-
-
 def is_write_approval_required(path: str) -> bool:
-    """True if ``path`` is approval-gated: ``~/.ssh/config`` (ProxyCommand/Match exec)
-    or a governance-protected production file (SOUL.md / config.yaml / ``references/**``).
-    Interactive callers prompt, callers without a channel treat it as a block (fail closed)."""
+    """True if ``path`` is approval-gated (``~/.ssh/config``): interactive callers
+    prompt, callers without a channel treat it as a block (fail closed)."""
     homes, resolved = _homes_and_resolved(path)
-    if any(resolved in build_write_approval_paths(home) for home in homes):
-        return True
-    return any(_governance_protected(resolved, home) for home in homes)
+    return any(resolved in build_write_approval_paths(home) for home in homes)
 
 
 # Secret-bearing project-local env file basenames, blocked anywhere on disk.
