@@ -14,6 +14,11 @@ from utils import base_url_host_matches, base_url_hostname
 
 _MINIMAX_ANTHROPIC_PREFIXES = ("https://api.minimax.io/anthropic", "https://api.minimaxi.com/anthropic")
 
+# 我方 MaaS coding plan 主机（来自 config.yaml providers）—— 用**精确主机名**而非
+# `maas.aliyuncs.com` 子域后缀：后者会把上游自带的 token-plan.ap-southeast-1 /
+# apex maas.aliyuncs.com 一并判为需 Bearer，判据过宽（业主批准 maas-host-narrow ce00a8398fa3）。
+_ALIBABA_MAAS_BEARER_HOSTS = ("token-plan.cn-beijing.maas.aliyuncs.com",)
+
 
 def _normalize_base_url_text(base_url) -> str:
     """Coerce a base URL (str or ``httpx.URL``) to a stripped string; "" when falsy."""
@@ -133,7 +138,7 @@ def _requires_bearer_auth(base_url: str | None) -> bool:
         or base_url_host_matches(normalized, "palantirfoundry.com")
         or base_url_host_matches(normalized, "api.commandcode.ai")
         or base_url_host_matches(normalized, "ark.cn-beijing.volces.com")  # Volcengine Ark coding plan
-        or base_url_host_matches(normalized, "maas.aliyuncs.com")  # Alibaba Cloud MaaS coding plan
+        or any(base_url_host_matches(normalized, h) for h in _ALIBABA_MAAS_BEARER_HOSTS)  # Alibaba Cloud MaaS（精确主机名）
     )
 
 
