@@ -124,10 +124,6 @@ def _detect_api_mode_for_url(base_url: str) -> Optional[str]:
         # (api.anthropic.com.attacker.test) and path-segment spoofing (proxy.test/api.anthropic.com/v1).
         # (#32243)
         return "anthropic_messages"
-    if hostname == "ark.cn-beijing.volces.com" and "/api/coding" in normalized:
-        return "anthropic_messages"
-    if hostname == "token-plan.cn-beijing.maas.aliyuncs.com" and "/apps/anthropic" in normalized:
-        return "anthropic_messages"
     return None
 
 
