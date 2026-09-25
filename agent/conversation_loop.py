@@ -985,18 +985,21 @@ def _invalid_tool_name_error_content(name: str, valid_tool_names) -> str:
 
 
 def _note_content_policy_blocked(agent, error_detail: str, *, source: str) -> None:
-    """Surface a content-policy block to the user AND leave an auditable record.
+    """Surface a content-policy block to the user (single sink; audit lives out-of-tree).
 
     2026-09-23 (owner-approved "CU: 要"): a provider safety-filter refusal is terminal on the
     first attempt (``retryable=False``, credentials unchanged), so the turn carried **no visible
     signal at all** — evidence: research profile 13:08, upstream 400 ``Content Exists Risk`` →
     ``API call failed (attempt 1/3, not retryable)``, zero messages persisted in that window,
-    zero ``Model fallback`` lines. Two sinks:
+    zero ``Model fallback`` lines. One sink:
 
     1. ``_buffer_fallback_notice`` — the one-shot notice channel that is proven to reach the chat
        (same mechanism as "⚠️ Model fallback: ..."); it is emitted at turn end.
-    2. ``runtime/content-policy-events.jsonl`` — one JSON line per block, profile-scoped, so blocks
-       are auditable after the fact (which provider/model refused, what the provider said).
+
+    The audit record is NOT written here any more (2026-09-25): the host's ``risk-degrade-notice``
+    plugin logs every provider content-policy refusal to ``runtime/risk-degrade-events.jsonl`` from
+    the ``api_request_error`` hook (provider / model / status_code / reason / error_message /
+    session_id / platform), so that record has a single writer and stays out of the core tree.
 
     Never raises: observability must not break the failure path.
     """
@@ -1015,24 +1018,6 @@ def _note_content_policy_blocked(agent, error_detail: str, *, source: str) -> No
         ))
     except Exception:  # noqa: BLE001 — never break the failure path
         logger.debug("content-policy notice buffering failed", exc_info=True)
-    try:
-        import datetime as _dt
-        import json as _json
-        import os as _os
-
-        from hermes_constants import get_hermes_home
-
-        path = _os.path.join(str(get_hermes_home()), "runtime", "content-policy-events.jsonl")
-        _os.makedirs(_os.path.dirname(path), exist_ok=True)
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(_json.dumps({
-                "ts": _dt.datetime.now().astimezone().isoformat(timespec="seconds"),
-                "event": "content_policy_blocked", "source": source,
-                "provider": provider, "model": model, "detail": detail,
-                "session_id": str(getattr(agent, "session_id", "") or ""),
-            }, ensure_ascii=False) + "\n")
-    except Exception:  # noqa: BLE001
-        logger.debug("content-policy audit record failed", exc_info=True)
 
 
 def _content_policy_blocked_result(
