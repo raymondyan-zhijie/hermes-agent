@@ -8,6 +8,8 @@ from typing import Any, Dict, List, Optional
 from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger("tools.process_registry")
+from pathlib import Path
+
 
 
 class ProcessCheckpointMixin:
@@ -16,7 +18,6 @@ class ProcessCheckpointMixin:
     def _write_checkpoint(self, extra_entries: Optional[List[Dict[str, Any]]] = None):
         """Write running process metadata to the checkpoint file atomically."""
         from tools.process_registry import _checkpoint_path, _CHECKPOINT_FIELDS
-        from tools.process_registry import checkpoint_path_for_profile, profile_from_entry
         from utils import atomic_json_write
 
         try:
@@ -163,3 +164,74 @@ class ProcessCheckpointMixin:
                 })
         self._write_checkpoint(extra_entries=unresolved_scope_entries)
         return recovered
+
+
+
+def _canonical_session_profile(namespace: str) -> str:
+    """``<ns>`` slot of a session key -> owning profile id.
+
+    Mirror of ``gateway/session.py:profile_from_session_key_namespace`` (the inverse of
+    ``_session_key_namespace``): the DEFAULT profile's namespace is literally ``main``, while a
+    profile literally named ``main`` is marked ``main~`` (``~`` sits outside the profile-id
+    alphabet).  Reimplemented here rather than imported: ``tools`` must not depend on ``gateway``.
+    """
+    if namespace == "main":
+        return "default"
+    return "main" if namespace == "main~" else namespace
+
+
+def profile_from_entry(entry: Dict[str, Any]) -> str:
+    """Owning profile of a checkpoint entry: explicit field -> task_id/session_key -> "" (ambient).
+
+    The multiplexed gateway serves every profile from ONE process, so the ambient
+    ``HERMES_HOME`` at write time is NOT the owning profile of a tracked process
+    (P1-e: a default-profile background process was persisted into
+    ``profiles/design/processes.json``).  The spawn-time session profile is the
+    truth; the task id is the fallback for entries written before the field existed.
+    """
+    import re  # local: this module has no top-level ``re`` import
+
+    v = str(entry.get("profile") or "").strip()
+    if v:
+        return v
+    # ``~`` is outside the profile-id alphabet but IS the marker of a profile literally named
+    # ``main`` -- leaving it out of the class made ``agent:main~:`` fall through to "" (ambient).
+    pat = re.compile(r"^(?:session:)?agent:([A-Za-z0-9_.~-]+):")
+    for key in ("owner_task_id", "task_id", "session_key"):
+        m = pat.match(str(entry.get(key) or "").strip())
+        if m:
+            # NEVER return the raw namespace: ``agent:main:`` is the DEFAULT profile, and
+            # inventing a "main" directory would both lose the entry and derail the write
+            # (see ``checkpoint_path_for_profile``).
+            return _canonical_session_profile(m.group(1))
+    return ""
+
+
+def checkpoint_path_for_profile(profile: str) -> Path:
+    """``processes.json`` owned by *profile*.
+
+    ``""`` -> this scope's authoritative ``_checkpoint_path()`` (the pre-existing behaviour: an
+    entry with no owner information belongs to whoever is writing it, and tests/CLI runs may
+    redirect ``CHECKPOINT_PATH``).  ``"default"`` -> the ROOT home's file, because the default
+    profile IS the launch home even when this process is serving another profile.  A named
+    profile -> its own home's file, but ONLY when that home exists:
+    ``atomic_json_write`` -> ``mkdir_under_hermes_home`` REFUSES a missing named-profile home
+    with ``FileNotFoundError`` (it asserts before mkdir), and that exception aborts the whole
+    checkpoint write -- every profile later in the batch silently loses its file.  A stale name
+    therefore degrades to this scope's checkpoint instead of aborting.
+    """
+    from tools.process_registry import _checkpoint_path  # lazy: 环形导入规避
+    from hermes_constants import get_default_hermes_root
+    if not profile:
+        return _checkpoint_path()
+    root = get_default_hermes_root()
+    if profile == "default":
+        return root / "processes.json"
+    target = root / "profiles" / profile / "processes.json"
+    if not target.parent.is_dir():
+        logger.warning(
+            "Checkpoint entry claims profile %r whose home does not exist; keeping it in this "
+            "scope's own checkpoint instead of creating %s", profile, target.parent)
+        return _checkpoint_path()
+    return target
+
