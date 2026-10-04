@@ -152,6 +152,12 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    spawn_budget_held: Optional[str] = None
+    """Capacity hold that refused this tick's spawns, e.g. ``"max_in_progress 1/1"``
+    or ``"max_spawn 1/1"``. Capacity is NOT a failure — the deferred tasks are
+    picked up on a later tick. Recorded so ``describe_suppression`` can name it
+    instead of the "dispatcher stuck" warning degrading to a bare zero-spawn
+    count that reads as a broken profile (#111910)."""
 
 
 def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
@@ -166,6 +172,7 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
     """
     counts: dict[str, int] = {}
     pressure: Optional[str] = None
+    capacity: list[str] = []
     for res in results:
         if res is None:
             continue
@@ -177,9 +184,18 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
         if res.memory_pressure:
             pressure = res.memory_pressure
+        # Capacity holds ("profile busy" / "host at cap") are deferred-but-healthy,
+        # NOT a broken profile. Without these two the tick's description is empty
+        # and the "dispatcher stuck" warning reads as a hard failure (#111910).
+        for _tid, _assignee, _current in res.skipped_per_profile_capped:
+            _key = f"profile_busy:{_assignee}"
+            counts[_key] = counts.get(_key, 0) + 1
+        if res.spawn_budget_held:
+            capacity.append(res.spawn_budget_held)
     parts = [f"{k}={v}" for k, v in sorted(counts.items())]
     if pressure:
         parts.append(f"memory_pressure={pressure}")
+    parts.extend(sorted(capacity))
     return ", ".join(parts)
 
 
@@ -2185,12 +2201,14 @@ def _tick_spawn_budget(
     # Both ready and review loops consume from the same budget.
     if max_spawn is not None:
         if running_count >= max_spawn:
+            result.spawn_budget_held = f"max_spawn {running_count}/{max_spawn}"
             return False, None
         spawn_budget = max_spawn - running_count
 
     if max_in_progress is not None:
         total_running = running_count + count_running_tasks_other_boards(board)
         if total_running >= max_in_progress:
+            result.spawn_budget_held = f"max_in_progress {total_running}/{max_in_progress}"
             return False, None
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
