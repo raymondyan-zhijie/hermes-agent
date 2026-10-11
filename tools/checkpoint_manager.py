@@ -19,6 +19,7 @@ Storage layout (single shared store, git objects deduplicated across projects)
             refs/hermes/<hash16>        — per-project branch tip
             indexes/<hash16>            — per-project git index
             projects/<hash16>.json      — {workdir, created_at, last_touch}
+            snapshot-state/<hash16>.json — last snapshot outcome (ok/code/detail)
             info/exclude                — default excludes (shared)
         .last_prune                     — auto-prune idempotency marker
         legacy-<timestamp>/             — archived pre-v2 per-project shadow
@@ -88,6 +89,7 @@ _REFS_PREFIX = "refs/hermes"
 _INDEXES_DIRNAME = "indexes"
 _PROJECTS_DIRNAME = "projects"
 _LEDGERS_DIRNAME = "ledgers"
+_SNAPSHOT_STATE_DIRNAME = "snapshot-state"
 _LEGACY_PREFIX = "legacy-"
 _PRUNE_MARKER_NAME = ".last_prune"
 
@@ -160,8 +162,34 @@ DEFAULT_EXCLUDES = [
 # Git subprocess timeout (seconds).
 _GIT_TIMEOUT: int = max(10, min(60, env_int("HERMES_CHECKPOINT_TIMEOUT", 30)))
 
-# Max files to snapshot — skip huge directories to avoid slowdowns.
-_MAX_FILES = 50_000
+# Staging budget (seconds) for ``git add -A`` — the one git step whose cost grows
+# with the tree instead of with the plumbing around it.  ``_GIT_TIMEOUT`` stays
+# clamped so a cheap call can never hold a turn for minutes, but that same 60 s
+# ceiling is structurally too small for the first snapshot of a large project:
+# 19,992 files / 3.2 GB measured 30.9 s of pure hashing *before* any write
+# amplification, so a cold object DB exceeds it every time rather than
+# occasionally.  Applies to the staging call only.
+_GIT_STAGE_TIMEOUT: int = max(10, min(600, env_int("HERMES_CHECKPOINT_STAGE_TIMEOUT", 180)))
+
+# A leftover ``<index>.lock`` older than this, with no live holder, is removed
+# once and the stage retried.  Git writes ``<GIT_INDEX_FILE>.lock`` and renames it
+# into place at the end, so a stage that its own timeout kills leaves the lock
+# behind and every later add in that project fails with
+# ``fatal: Unable to create '<index>.lock': File exists`` (rc=128) — forever, and
+# on the gateway path silently.  ``--ignore-errors`` does not soften it: the lock
+# is fatal before any entry is read (measured, git 2.53).
+_STALE_LOCK_AGE_S: int = max(0, env_int("HERMES_CHECKPOINT_STALE_LOCK_AGE", 30))
+
+# Upper bound on generated pathspec exclusions for oversize files.  Past it the
+# pre-stage filter gives up and the post-stage drop stays the only guard, so a
+# pathological project cannot push the argument list at ARG_MAX.
+_MAX_PATHSPEC_EXCLUDES = 2000
+
+# Max entries to snapshot — skip huge directories to avoid slowdowns.  The count
+# comes from ``_dir_file_count`` (``rglob('*')``), so it includes directories, and
+# it is overridable per host because a working tree can legitimately outgrow a
+# constant: the skip writes no snapshot at all.
+_MAX_FILES: int = max(100, env_int("HERMES_CHECKPOINT_MAX_ENTRIES", 50_000))
 
 # Valid git commit hash pattern: 4–40 hex chars (short or full SHA-1/SHA-256).
 _COMMIT_HASH_RE = re.compile(r'^[0-9a-fA-F]{4,64}$')
@@ -235,6 +263,11 @@ def _index_path(store: Path, dir_hash: str) -> Path:
 
 def _ledger_path(store: Path, dir_hash: str) -> Path:
     return store / _LEDGERS_DIRNAME / f"{dir_hash}.json"
+
+
+def _snapshot_state_path(store: Path, dir_hash: str) -> Path:
+    """Per-project last-snapshot outcome, written for read-only probes."""
+    return store / _SNAPSHOT_STATE_DIRNAME / f"{dir_hash}.json"
 
 
 def _hash_file(path: Path) -> Optional[str]:
@@ -434,6 +467,102 @@ def _git_out(args: List[str], store: Path, working_dir: str, rc: Optional[Set[in
     """stdout of a successful git call, else ``""``."""
     ok, out, _ = _run_git(args, store, working_dir, allowed_returncodes=rc)
     return out if ok else ""
+
+
+# ``git add`` complaints that are entry-level (one path) rather than fatal to the
+# project.  ``--ignore-errors`` still exits non-zero for them but writes the
+# index, so a snapshot with those entries skipped is usable.
+_ENTRY_LEVEL_ADD_ERR_RE = re.compile(
+    r"^error: (?:open\(|unable to (?:index|stat) )"
+)
+_BENIGN_ADD_ERR = "working directory not found"
+
+
+def _index_lock_blocked(stderr: str) -> bool:
+    """Whether a stage failure is the ``<index>.lock: File exists`` dead end.
+
+    Matched on git's own wording rather than on a filename: the lock lives at
+    ``store/indexes/<hash>.lock``, so searching for the literal ``index.lock``
+    never matches the real message.
+    """
+    text = stderr or ""
+    return bool(re.search(r"Unable to create .*\.lock", text)) and bool(
+        re.search(r"File exists", text)
+    )
+
+
+def _stage_partial(stderr: str) -> bool:
+    """Whether a stage skipped only entry-level problems.
+
+    Every complaint has to be entry-level: a broken object DB, a full disk or a
+    bad pathspec must keep the stage failing closed.
+    """
+    complaints = [line.strip() for line in (stderr or "").splitlines() if line.strip()]
+    if not complaints:
+        return False
+    return all(_ENTRY_LEVEL_ADD_ERR_RE.match(line) for line in complaints)
+
+
+def _skipped_entries(stderr: str) -> List[str]:
+    """The paths named by tolerated entry-level stage errors, for the warning."""
+    out: List[str] = []
+    for line in (stderr or "").splitlines():
+        match = re.search(r"open\(\"(.*?)\"\)", line) or re.search(r"unable to stat '(.*?)'", line)
+        if match and match.group(1) not in out:
+            out.append(match.group(1))
+    return out
+
+
+def _lock_holder_visible(lock_path: Path) -> bool:
+    """Whether any process this user can inspect holds *lock_path* open.
+
+    ``/proc/<pid>/fd`` is readable for this user's own processes, and they are the
+    only ones that stage into this user's store.  When ``/proc`` is unavailable
+    (non-Linux host) or cannot be walked, the answer is "held": an unverifiable
+    lock is left alone rather than deleted on a guess.
+    """
+    target = str(lock_path)
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return True
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return True
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            fds = list((entry / "fd").iterdir())
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                if os.readlink(fd) == target:
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+def _removable_stale_lock(index_file: Path) -> Optional[Path]:
+    """The stale ``<index>.lock`` blocking *index_file*, when it is safe to delete.
+
+    Both conditions must hold.  Age alone would delete a live writer's lock — an
+    add over a large tree legitimately holds it for minutes; holder detection
+    alone would delete the lock a just-killed stage left a moment ago and race
+    the writer that is about to take it.  ``None`` means leave the lock alone.
+    """
+    lock = Path(str(index_file) + ".lock")
+    try:
+        age = time.time() - lock.stat().st_mtime
+    except OSError:
+        return None
+    if age < _STALE_LOCK_AGE_S:
+        return None
+    if _lock_holder_visible(lock):
+        return None
+    return lock
 
 
 def _ref_tip(store: Path, working_dir: str, ref: str) -> Optional[str]:
@@ -730,7 +859,13 @@ def _pre_v2_shadow_repos(base: Path) -> List[Dict]:
 
 
 def _dir_file_count(path: str) -> int:
-    """Quick file count estimate (stops early if over _MAX_FILES)."""
+    """Quick entry-count estimate (stops early if over _MAX_FILES).
+
+    Counts every entry ``rglob('*')`` yields — directories included — because
+    that is what the guard's ceiling has always been read against.  Returns at
+    most ``_MAX_FILES + 1``, so a caller never sees the true count of a tree the
+    guard rejects.
+    """
     count = 0
     try:
         for _ in Path(path).rglob("*"):
@@ -795,6 +930,13 @@ class CheckpointManager:
         self.max_total_size_mb = max(0, int(max_total_size_mb))
         self.max_file_size_mb = max(0, int(max_file_size_mb))
         self._checkpointed_dirs: Set[str] = set()
+        # (project, failure code) pairs already reported at WARNING this session —
+        # a permanently failing project must be visible without spamming a line
+        # per write.
+        self._warned_snapshot_problems: Set[Tuple[str, str]] = set()
+        # One report per process for "the whole store is over its budget": the
+        # condition is host-wide, so warning per take would drown the log.
+        self._warned_store_over_cap = False
 
     # ------------------------------------------------------------------
     # Turn lifecycle
@@ -873,7 +1015,7 @@ class CheckpointManager:
 
         # Stage the current tree so the name-only diff sees new files too.
         _run_git(["add", "-A"], store, abs_dir,
-                 timeout=_GIT_TIMEOUT * 2, index_file=index_file)
+                 timeout=_GIT_STAGE_TIMEOUT, index_file=index_file)
         ok, names_out, err = _run_git(
             ["diff", "--name-only", "-z", commit_hash, "--cached"],
             store, abs_dir, index_file=index_file,
@@ -1054,7 +1196,7 @@ class CheckpointManager:
 
         # Stage current state into the per-project index to compare.
         _run_git(["add", "-A"], store, abs_dir,
-                 timeout=_GIT_TIMEOUT * 2, index_file=index_file)
+                 timeout=_GIT_STAGE_TIMEOUT, index_file=index_file)
 
         ok_stat, stat_out, _ = _run_git(
             ["diff", "--stat", commit_hash, "--cached"],
@@ -1413,6 +1555,155 @@ class CheckpointManager:
     # Internal
     # ------------------------------------------------------------------
 
+    def _oversize_excludes(self, working_dir: str) -> List[str]:
+        """Pathspec exclusions for files above ``max_file_size_mb``.
+
+        The cap is enforced after staging, by dropping oversize paths from the
+        index — but ``git add`` has already hashed and written those blobs into
+        the object DB by then, so a 353 MB bundle costs its full size, and its
+        share of the shared store, on every first snapshot.  Excluding them from
+        the pathspec keeps the bytes out of the object database; the paths stay
+        out of the committed tree exactly as the post-stage drop already made
+        them.  Costs one ``stat``-walk of the project; past
+        ``_MAX_PATHSPEC_EXCLUDES`` matches it gives up and returns nothing.
+        """
+        cap = self.max_file_size_mb * 1024 * 1024
+        if cap <= 0:
+            return []
+        root = _normalize_path(working_dir)
+        found: List[str] = []
+        try:
+            for dirpath, dirnames, filenames in os.walk(root):
+                dirnames[:] = [
+                    d for d in dirnames
+                    if d not in (".git", ".hg", ".svn", ".worktrees")
+                ]
+                for name in filenames:
+                    candidate = os.path.join(dirpath, name)
+                    try:
+                        # ``stat`` (not ``lstat``) to agree with
+                        # :meth:`_exceeds_size_cap`, which measures the target.
+                        if os.stat(candidate).st_size <= cap:
+                            continue
+                    except OSError:
+                        continue
+                    rel = os.path.relpath(candidate, root)
+                    if rel not in found:
+                        found.append(rel)
+                    if len(found) > _MAX_PATHSPEC_EXCLUDES:
+                        logger.warning(
+                            "Checkpoint: more than %d oversize files in %s — skipping the "
+                            "pre-stage size filter; the post-stage drop still applies",
+                            _MAX_PATHSPEC_EXCLUDES, working_dir,
+                        )
+                        return []
+        except OSError as exc:
+            logger.debug("Checkpoint: oversize pre-filter walk failed for %s: %s", working_dir, exc)
+            return []
+        return [":(exclude,literal)" + rel for rel in found]
+
+    def _stage(self, store: Path, working_dir: str, index_file: Path) -> Tuple[bool, str, List[str]]:
+        """Stage the working tree into the per-project index.
+
+        Returns ``(ok, stderr, skipped)``.  ``skipped`` lists entries git could not
+        read: the index is written without them, so they are absent from this
+        snapshot and a rollback leaves them untouched instead of restoring them.
+        Retries once after removing a stale ``<index>.lock`` — what a stage killed
+        by its own timeout leaves behind, and which nothing else ever removes.
+        """
+        args = ["add", "-A", "--ignore-errors", "--", "."]
+        args += self._oversize_excludes(working_dir)
+        skipped: List[str] = []
+        err = ""
+        for attempt in (0, 1):
+            ok, _, err = _run_git(
+                args, store, working_dir,
+                timeout=_GIT_STAGE_TIMEOUT, index_file=index_file,
+            )
+            if ok:
+                return True, err, skipped
+            if _stage_partial(err) and index_file.exists():
+                # ``--ignore-errors`` exits non-zero for an unreadable entry but
+                # still writes the index: the snapshot is usable and partial.
+                skipped = _skipped_entries(err)
+                logger.warning(
+                    "Checkpoint: %d unreadable/vanished entr%s skipped while staging %s: %s "
+                    "(absent from this snapshot; a rollback leaves them as they are)",
+                    len(skipped), "y" if len(skipped) == 1 else "ies", working_dir,
+                    ", ".join(skipped[:5]) + ("…" if len(skipped) > 5 else ""),
+                )
+                return True, err, skipped
+            if attempt == 0 and _index_lock_blocked(err):
+                lock = _removable_stale_lock(index_file)
+                if lock is not None:
+                    try:
+                        lock.unlink()
+                    except OSError as exc:
+                        logger.warning(
+                            "Checkpoint: stale index lock %s could not be removed: %s", lock, exc,
+                        )
+                        return False, err, skipped
+                    logger.warning(
+                        "Checkpoint: removed stale index lock %s while staging %s "
+                        "(no live holder, age ≥ %ds); retrying once",
+                        lock, working_dir, _STALE_LOCK_AGE_S,
+                    )
+                    continue
+            return False, err, skipped
+        return False, err, skipped
+
+    def _record_snapshot_state(
+        self, store: Path, working_dir: str, *, ok: bool, code: str = "", detail: str = "",
+    ) -> None:
+        """Record this project's last snapshot outcome where a probe can read it.
+
+        Checkpoint failures are invisible on the gateway path, so the outcome is
+        written next to the project rather than only into a log: 435 checkpoint
+        errors accumulated with nothing on the host reading ``logs/errors.log``.
+        Best effort — never raises.
+        """
+        path = _snapshot_state_path(store, _project_hash(working_dir))
+        state: Dict = {
+            "workdir": str(_normalize_path(working_dir)),
+            "ok": ok,
+            "ts": time.time(),
+            "code": code,
+            "detail": detail[:400],
+        }
+        try:
+            if ok:
+                state["last_ok_ts"] = state["ts"]
+            else:
+                try:
+                    previous = json.loads(path.read_text(encoding="utf-8-sig"))
+                except (OSError, ValueError):
+                    previous = {}
+                if isinstance(previous, dict) and previous.get("last_ok_ts"):
+                    state["last_ok_ts"] = previous["last_ok_ts"]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(state), encoding="utf-8")
+        except OSError as exc:
+            logger.debug("Could not write snapshot state %s: %s", path, exc)
+
+    def _warn_snapshot_problem(self, store: Path, working_dir: str, code: str, detail: str) -> None:
+        """Report a snapshot that will not be taken — once per project per session.
+
+        The failure used to be a single DEBUG line, and while the raw git error
+        does reach ``logs/errors.log`` at ERROR nothing reads that file: one
+        project went eight days without a snapshot unnoticed.  A stable
+        ``Checkpoint FAILED`` prefix plus the ``snapshot-state`` file make the
+        condition visible without log scraping.
+        """
+        key = (str(_normalize_path(working_dir)), code)
+        if key not in self._warned_snapshot_problems:
+            self._warned_snapshot_problems.add(key)
+            logger.warning(
+                "Checkpoint FAILED for %s (%s): %s — no snapshot was taken, so rollback for "
+                "this project covers nothing after its last successful checkpoint",
+                working_dir, code, detail,
+            )
+        self._record_snapshot_state(store, working_dir, ok=False, code=code, detail=detail)
+
     def _take(self, working_dir: str, reason: str, *, prune: bool = True) -> bool:
         """Take a snapshot.  Returns True on success."""
         store = _store_path()
@@ -1424,9 +1715,17 @@ class CheckpointManager:
 
         _touch_project(store, working_dir)
 
-        # Quick size guard — don't try to snapshot enormous directories
-        if _dir_file_count(working_dir) > _MAX_FILES:
-            logger.debug("Checkpoint skipped: >%d files in %s", _MAX_FILES, working_dir)
+        # Quick size guard — don't try to snapshot enormous directories.  The
+        # reading is an entry count (directories included, see _dir_file_count),
+        # and the skip is reported: it produces no snapshot at all, so a quiet
+        # DEBUG line here is how a working tree silently stops being protected.
+        entries = _dir_file_count(working_dir)
+        if entries > _MAX_FILES:
+            self._warn_snapshot_problem(
+                store, working_dir, "too_many_entries",
+                f"more than {_MAX_FILES} entries in the working tree "
+                f"(raise HERMES_CHECKPOINT_MAX_ENTRIES to snapshot it anyway)",
+            )
             return False
 
         dir_hash = _project_hash(working_dir)
@@ -1460,15 +1759,18 @@ class CheckpointManager:
             index_file.parent.mkdir(parents=True, exist_ok=True)
 
         # Stage with per-project index.  Include a per-stage file-size filter
-        # via ``core.bigFileThreshold`` is not what we want — instead, we
-        # rely on the exclude file for broad patterns and post-stage prune
-        # any path whose size exceeds max_file_size_mb.
-        ok, _, err = _run_git(
-            ["add", "-A"], store, working_dir,
-            timeout=_GIT_TIMEOUT * 2, index_file=index_file,
-        )
+        # via ``core.bigFileThreshold`` is not what we want — instead, the
+        # oversize paths are excluded from the pathspec before git hashes them,
+        # and the exclude file covers the broad patterns (see :meth:`_stage`).
+        ok, err, skipped = self._stage(store, working_dir, index_file)
         if not ok:
-            logger.debug("Checkpoint git-add failed: %s", err)
+            if _BENIGN_ADD_ERR in err:
+                # The project directory vanished between the size guard and the
+                # stage: routine, and _run_git already logs it.  Keep it quiet
+                # so the reportable failures below stay meaningful.
+                logger.debug("Checkpoint git-add failed: %s", err)
+            else:
+                self._warn_snapshot_problem(store, working_dir, "git_add_failed", err)
             return False
 
         if self.max_file_size_mb > 0:
@@ -1552,6 +1854,11 @@ class CheckpointManager:
             return False
 
         logger.debug("Checkpoint taken in %s: %s (%s)", working_dir, reason, new_sha[:8])
+        self._record_snapshot_state(
+            store, working_dir, ok=True,
+            code="partial_entries" if skipped else "",
+            detail=(", ".join(skipped[:5])) if skipped else "",
+        )
 
         # Count and size budgets share one failure boundary.
         if prune:
@@ -1619,16 +1926,30 @@ class CheckpointManager:
             )
 
     def _prune(self, store: Path, working_dir: str, ref: str) -> None:
-        """Checkpoint-take path: snapshot-count budget plus one size round, gc deferred to the
-        periodic prune — a repack here held the tool call for the whole gc on a large store."""
+        """Checkpoint-take path: this project's snapshot-count budget plus one size round,
+        scoped to this project, with the gc deferred to the periodic prune — a repack here
+        held the tool call for the whole gc on a large store.
+
+        The size round used to rewrite the oldest snapshot of *every* project whenever the
+        shared store was over ``max_total_size_mb``, so one oversized project discarded
+        unrelated projects' oldest rollback anchors on every take (silently, with no way
+        back).  Only the project being snapshotted loses a snapshot here; the store-wide
+        loop belongs to the maintenance prune.
+        """
         from tools.checkpoint_pruning import Pruner, PruneError
 
         pruner = Pruner(_run_git, store, working_dir, _GIT_TIMEOUT, _dir_size_bytes, _REFS_PREFIX)
         try:
             pruner.trim(ref, self.max_snapshots)
-            if pruner.drop_one_round(self.max_total_size_mb * 1024 * 1024):
-                logger.info("Checkpoint store exceeded %d MB — dropped the oldest snapshot per project; "
-                            "space is reclaimed by the next prune", self.max_total_size_mb)
+            if pruner.drop_oldest_snapshot(ref, self.max_total_size_mb * 1024 * 1024):
+                if not self._warned_store_over_cap:
+                    self._warned_store_over_cap = True
+                    logger.warning(
+                        "Checkpoint store is over its %d MB budget — dropped the oldest snapshot "
+                        "of %s; no other project's snapshots were touched. Run the maintenance "
+                        "prune (`hermes checkpoints prune`) to reclaim the space.",
+                        self.max_total_size_mb, working_dir,
+                    )
         except (PruneError, OSError) as exc:
             logger.warning("Checkpoint pruning stopped: %s", exc)
 
