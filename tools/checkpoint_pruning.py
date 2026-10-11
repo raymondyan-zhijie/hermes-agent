@@ -112,9 +112,9 @@ class Pruner:
     def drop_oldest_snapshot(self, ref: str, cap_bytes: int) -> bool:
         """Take-path size response, scoped to ONE project (this one).
 
-        ``drop_one_round`` rewrites every project's ref when the shared store is
-        over the cap, so a single oversized project silently discarded unrelated
-        projects' oldest rollback anchors on *every* take.  The take path knows
+        The former take-path response rewrote every project's ref when the shared
+        store was over the cap, so a single oversized project silently discarded
+        unrelated projects' oldest rollback anchors on *every* take.  The take path knows
         exactly one project, so only that project loses a snapshot here; the
         store-wide loop stays in :meth:`enforce_size`, where the maintenance
         prune runs it deliberately.
@@ -127,23 +127,6 @@ class Pruner:
         self._rewrite(ref, commits, commits[1:], gc=False)
         return True
 
-    def drop_one_round(self, cap_bytes: int) -> bool:
-        """Store-wide one round: drop the oldest snapshot of every project.
-
-        No longer used by the checkpoint take path (see
-        :meth:`drop_oldest_snapshot`): reached from a take it destroys projects
-        the take has nothing to do with.  Kept for callers that really do mean
-        "every project", if any appear.
-        """
-        if cap_bytes <= 0 or self.dir_size(self.store) <= cap_bytes:
-            return False
-        changed = False
-        for ref in self._git(["for-each-ref", "--format=%(refname)", self.refs_prefix]).splitlines():
-            commits = self._commits(ref)
-            if len(commits) > 1:
-                self._rewrite(ref, commits, commits[1:], gc=False)
-                changed = True
-        return changed
 
     def enforce_size(self, cap_bytes: int) -> bool:
         """Periodic prune: gc per round (the measurement only moves after a repack) until the
