@@ -508,6 +508,22 @@ _IGNORED_ADVICE_HINT_RE = re.compile(r"^hint: ")
 # :meth:`_oversize_excludes` is what removes the advisory in the first place).
 _COMPLAINT_LINE_RE = re.compile(r"^(?:error|fatal|warning|usage|BUG):")
 
+# （乙取向 · 2026-10-12）git 的**通知行**：``warning:`` 前缀（如嵌套仓
+# ``warning: adding embedded git repository: <dir>``）与 ``hint:`` 前缀（其
+# 配套建议块）。它们描述的是"git 照常完成了什么"，不是 stage 失败的原因：
+# 嵌套仓本身仍被加入 index（gitlink），快照可用。把它们计入 complaints 会让
+# ``_stage_partial`` 的行首锚定正则必然不匹配 ⇒ 整项 False ⇒ 快照全停——
+# 这是真实缺陷（10:15 对含 gtest1–4 嵌套仓的 take 全停，见母卡 t_9f4b5694）。
+# 判据沿用既有口径：**行首前缀**即通知，不看路径内容。行内出现第 2 个消息
+# 令牌（``;``/``|`` 拼接）时仍 fail-closed —— 与 ``_MSG_TOKEN_BOUNDARY_RE``
+# 同一道护栏，防通知行被嫁接致命消息。
+_GIT_NOTICE_LINE_RE = re.compile(r"^(?:warning|hint):")
+# 通知行的行内拼接护栏：``;``/``|`` 边界之后出现第 2 个消息令牌 ⇒ 该行是
+# 嫁接产物（通知行 + 致命消息拼接），保留为 complaint ⇒ fail-closed。
+_MSG_MIDLINE_TOKEN_RE = re.compile(
+    r"(?i)(?:;\s*|\|\s*)(?:error|fatal|warning|usage|bug):"
+)
+
 
 def _index_lock_blocked(stderr: str) -> bool:
     """Whether a stage failure is the ``<index>.lock: File exists`` dead end.
@@ -557,6 +573,15 @@ def _parse_stage_stderr(stderr: str) -> Tuple[List[str], List[str]]:
                 index += 1
             while index < len(lines) and _IGNORED_ADVICE_HINT_RE.match(lines[index]):
                 index += 1  # "Use -f …" / "Disable this message …"
+            continue
+        # （乙取向）git 通知行（``warning:``/``hint:`` 前缀）不是 complaint：
+        # 嵌套仓仍被加入 index，快照可用。行内拼接第 2 个消息令牌
+        # （``;``/``|`` 边界后出现 ``error:``/``fatal:`` 等）时仍保留为
+        # complaint ⇒ fail-closed（与 `_MSG_TOKEN_BOUNDARY_RE` 同一道护栏）。
+        if _GIT_NOTICE_LINE_RE.match(lines[index]):
+            if _MSG_MIDLINE_TOKEN_RE.search(lines[index]):
+                complaints.append(lines[index])
+            index += 1
             continue
         complaints.append(lines[index])
         index += 1
