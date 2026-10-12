@@ -475,14 +475,64 @@ def _git_out(args: List[str], store: Path, working_dir: str, rc: Optional[Set[in
 _ENTRY_LEVEL_ADD_ERR_RE = re.compile(
     r"^error: (?:open\(|unable to (?:index|stat) |\S+ does not have a commit checked out$)"
 )
-# 结构性命中判据（v3b-R1）：一条 git 消息通常占一行。若同一行里在消息边界
-# （行首 / ';' / '|'）之后出现第 2 个消息令牌，则该行是拼接产物 ⇒ 整项 fail-closed。
+# 结构性命中判据（v3b-R1 + R1′ 引号段感知）：一条 git 消息通常占一行。若同一行里在
+# 消息边界（行首 / ';' / '|'）之后出现第 2 个消息令牌，则该行是拼接产物 ⇒ 整项 fail-closed。
 # 令牌表沿用本文件既有口径（与 `_COMPLAINT_LINE_RE` 同族，大小写不敏感）。
-# 只按「消息边界 + 令牌」判，不枚举毒词、不看路径内容 ⇒ 既不漏防表外措辞，
-# 也不误伤含 'fatal:' / 'is empty' 等子串的合法路径名。
+# 只按「消息边界 + 令牌」判，不枚举毒词 ⇒ 不漏防表外措辞。
+#
+# R1′（kimi-Q8 引号盲区修）：令牌只在**引号段之外**计数。git 把路径名放在引号里
+# —— `error: open("<path>")`（双引号 C-style）、`error: unable to index file '<path>'`
+# 与 `error: '<path>' does not have a commit checked out`（单引号）—— 而路径名是本判据
+# 唯一不掌控的输入：文件名合法地含 `; fatal: `（实测 git 2.53：`a; fatal: b.txt` 可
+# add 可 commit）。git 打印 `error: open("a; fatal: b.txt"): Permission denied`，段内
+# 那个 `; fatal:` 落在引号段内、并不是第二条消息；按原口径却被数成第 2 个令牌 ⇒
+# 整项判非条目级 ⇒ 该工作区**新快照静默全停**（fail-closed 向，非误拍）。
+# 屏蔽引号段后再计数 ⇒ 该行恢复为条目级。
+#
+# 方向性（不得引入 fail-open）：
+#   ① 与 `open(`/`unable to …` 同型的**拼接**仍须判非条目级 —— 引号按「同类型、就近成对」
+#      匹配：`error: open("a"): Permission denied; fatal: …` 中 `; fatal:` 落在成对引号
+#      之外 ⇒ 照旧数到 2 个令牌 ⇒ fail-closed（实测 G1/G2/Q1/Q2 全部保持）。
+#   ② **未闭合**的引号一律不屏蔽（整行照原样计数）；路径名内插入引号会打断配对 ⇒ 其后
+#      内容照常计数。故「引号藏毒」不能借屏蔽蒙混过关。
 _MSG_TOKEN_BOUNDARY_RE = re.compile(
     r"(?i)(?:^|;\s*|\|\s*)(?:error|fatal|warning|usage|bug):"
 )
+
+
+def _outside_quotes(line: str) -> str:
+    """*line* 里 git 引号包裹的路径段被空格屏蔽掉后的文本（R1′ 用）。
+
+    git 只在少数几种消息里给路径加引号，本判据不去枚举那几种消息（那会把 R1 退回
+    「枚举措辞」的旧病），而是按**引号本身的配对**屏蔽：自左向右扫，遇到 `"` 或 `'`
+    就与**同类型的下一个**该字符成对，中间内容一律屏蔽。
+
+    「就近成对」而非「贪心到最后一个」是刻意的：路径名内若嵌了同类引号（`q"uote`），
+    配对会被打断，其后内容（可能含 `; fatal: `）照常参与计数 ⇒ 拼接产物仍然 fail-closed。
+    整行里任一同类型引号找不到配对 ⇒ 原样返回整行（不屏蔽任何内容）—— 未闭合引号绝不
+    允许把消息令牌藏起来。
+    """
+    spans: List[Tuple[int, int]] = []
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if ch != '"' and ch != "'":
+            i += 1
+            continue
+        end = line.find(ch, i + 1)
+        if end == -1:
+            return line  # 未闭合 ⇒ 不屏蔽（fail-closed）
+        spans.append((i, end + 1))
+        i = end + 1
+    if not spans:
+        return line
+    out = list(line)
+    for start, end in spans:
+        for k in range(start, end):
+            out[k] = " "
+    return "".join(out)
+
+
 _BENIGN_ADD_ERR = "working directory not found"
 
 # ``git add`` prints this advisory and exits 1 when the pathspec *names* a path a
@@ -603,7 +653,7 @@ def _stage_partial(stderr: str) -> bool:
         return bool(ignored)
     return all(
         _ENTRY_LEVEL_ADD_ERR_RE.match(line)
-        and len(_MSG_TOKEN_BOUNDARY_RE.findall(line)) < 2
+        and len(_MSG_TOKEN_BOUNDARY_RE.findall(_outside_quotes(line))) < 2
         for line in complaints
     )
 
@@ -1721,8 +1771,24 @@ class CheckpointManager:
             return []
         root = _normalize_path(working_dir)
         found: List[str] = []
+        # 嵌套仓（nested repo / gitlink）：其下任何路径都不能进入 ``:(exclude,literal)``
+        # pathspec —— git 2.53 实测：``git add -A -- :(exclude,literal)<sub>/<file>`` 在
+        # ``<sub>`` 是嵌套仓（parent 是 160000 gitlink 或 ``<sub>/.git`` 在）时会 ``rc=128``
+        # 并打印 ``fatal: Pathspec ':(exclude,literal)<sub>/<file>' is in submodule '<sub>'``，
+        # 整项 ``git add`` 失败 ⇒ 该工作区所有新快照静默全停（D3 线 · t_136980fe）。
+        # ``git check-ignore`` 对这类路径自身也 ``rc=128 fatal``，无法救场 ⇒ 必须在
+        # pathspec 构造点处理。识别口径：从 root 起 os.walk 时遇到含 ``.git`` 的目录，
+        # 即视为嵌套仓、**不进该目录、不把其下任何路径加入 pathspec**（嵌套仓本身的
+        # 文件不属本工作区快照对象，由嵌套仓自己负责）。
+        nested_repo_roots: Set[str] = set()
         try:
             for dirpath, dirnames, filenames in os.walk(root):
+                # 检测嵌套仓（**在先**，避免被下方 ``dirnames`` 过滤抹掉）：
+                # 等 nested 含 ``.git`` 目录 ⇒ 不进该目录、不把其下任何路径加入 pathspec。
+                if ".git" in dirnames:
+                    nested_repo_roots.add(os.path.normpath(dirpath))
+                    dirnames[:] = []
+                    continue
                 dirnames[:] = [
                     d for d in dirnames
                     if d not in (".git", ".hg", ".svn", ".worktrees")
@@ -1749,6 +1815,30 @@ class CheckpointManager:
         except OSError as exc:
             logger.debug("Checkpoint: oversize pre-filter walk failed for %s: %s", working_dir, exc)
             return []
+        if nested_repo_roots:
+            # rfb-Δ1（复核 rfb2 发现）：第二重剔除原判据用绝对 ``rp`` 匹配相对 ``rel``，恒 False
+            # ⇒ 属空保险。改为先取 ``root`` 相对基准 ``rn``（与 ``found`` 收集的 ``rel`` 同基准），
+            # ``rel == rn``（仓库根名场景）或 ``rel.startswith(rn + os.sep)``（子路径）。
+            _nested_rel = sorted(
+                os.path.relpath(rp, root) for rp in nested_repo_roots
+            )
+            before = len(found)
+            found = [
+                rel for rel in found
+                if not any(
+                    rel == rn or rel.startswith(rn + os.sep)
+                    for rn in _nested_rel
+                )
+            ]
+            dropped = before - len(found)
+            if dropped:
+                logger.debug(
+                    "Checkpoint: %d oversize path(s) live under nested repo(s) in %s — left "
+                    "out of the pathspec (git fatal on submodule pathspec entries): %s",
+                    dropped, working_dir,
+                    ", ".join(sorted(nested_repo_roots)[:3])
+                    + ("…" if len(nested_repo_roots) > 3 else ""),
+                )
         if found:
             # Naming an already-ignored path here would make the stage exit 1 with
             # the ignored-paths advisory — those paths stay out of the commit
