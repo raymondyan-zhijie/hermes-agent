@@ -473,9 +473,40 @@ def _git_out(args: List[str], store: Path, working_dir: str, rc: Optional[Set[in
 # project.  ``--ignore-errors`` still exits non-zero for them but writes the
 # index, so a snapshot with those entries skipped is usable.
 _ENTRY_LEVEL_ADD_ERR_RE = re.compile(
-    r"^error: (?:open\(|unable to (?:index|stat) )"
+    r"^error: (?:open\(|unable to (?:index|stat) |\S+ does not have a commit checked out$)"
+)
+# 结构性命中判据（v3b-R1）：一条 git 消息通常占一行。若同一行里在消息边界
+# （行首 / ';' / '|'）之后出现第 2 个消息令牌，则该行是拼接产物 ⇒ 整项 fail-closed。
+# 令牌表沿用本文件既有口径（与 `_COMPLAINT_LINE_RE` 同族，大小写不敏感）。
+# 只按「消息边界 + 令牌」判，不枚举毒词、不看路径内容 ⇒ 既不漏防表外措辞，
+# 也不误伤含 'fatal:' / 'is empty' 等子串的合法路径名。
+_MSG_TOKEN_BOUNDARY_RE = re.compile(
+    r"(?i)(?:^|;\s*|\|\s*)(?:error|fatal|warning|usage|bug):"
 )
 _BENIGN_ADD_ERR = "working directory not found"
+
+# ``git add`` prints this advisory and exits 1 when the pathspec *names* a path a
+# .gitignore already ignores — including when the name arrives as an
+# ``:(exclude,literal)`` entry, which is exactly how the pre-stage size filter is
+# built.  It is not a stage failure: the other entries are staged and the index is
+# written (measured, git 2.53).  Unrecognised, it turned one ignored oversize file
+# into ``git_add_failed`` for the whole project, whose snapshots then stopped
+# entirely while the log said only "ignored by one of your .gitignore files".
+_IGNORED_PATHS_ADVICE_RE = re.compile(
+    r"^The following paths are ignored by one of your \.gitignore files:"
+)
+_IGNORED_ADVICE_HINT_RE = re.compile(r"^hint: ")
+# A line git prints as a complaint rather than as one of the advisory's path
+# lines.  Such a line always ends the advisory's path run — and it must: with
+# ``advice.addIgnoredFile`` false git prints the header and the path lines and
+# **no** ``hint:`` lines at all, so a run that only ended on ``hint:``/EOF would
+# swallow a genuine failure printed after the advisory (a corrupted object DB, a
+# full disk) and report the project as partially snapshotted.
+# A file whose *name* starts with ``error:``/``fatal:`` is therefore read as a
+# complaint instead of as an ignored path: the stage then stays fail-closed, which
+# is the safe direction (no wrong snapshot; the pre-stage filter in
+# :meth:`_oversize_excludes` is what removes the advisory in the first place).
+_COMPLAINT_LINE_RE = re.compile(r"^(?:error|fatal|warning|usage|BUG):")
 
 
 def _index_lock_blocked(stderr: str) -> bool:
@@ -491,26 +522,115 @@ def _index_lock_blocked(stderr: str) -> bool:
     )
 
 
+def _parse_stage_stderr(stderr: str) -> Tuple[List[str], List[str]]:
+    """Split failed ``git add`` stderr into (complaints, ignored-path names).
+
+    The ignored-paths advisory is consumed whole — its header, the path lines it
+    lists, then git's own ``hint:`` lines — so a genuine error printed next to it
+    is still returned as a complaint.  Matching on git's wording rather than on
+    any path keeps every other message in the fail-closed set.
+
+    The path-line run ends at the first line that is not a path: a ``hint:`` line,
+    a complaint (``error:``/``fatal:``/…), or the end of the message.  Ending it on
+    ``hint:`` alone would be a failure-open hole — ``advice.addIgnoredFile=false``
+    (settable in the store's own config, which ``_git_env`` does not mask) makes
+    git print the header and the paths with **no** hint lines, and everything
+    printed after the advisory would then be read as ignored paths.
+    """
+    # NOTE (measured, git 2.53): the advisory's path lines are git's own
+    # short-form pathspec echo — for a path that is ignored, that is the plain
+    # relative path (no ``:(exclude,literal)`` prefix, no leading ``./``), which is
+    # what :meth:`_oversize_excludes` names in the pathspec.
+    lines = [line.strip() for line in (stderr or "").splitlines() if line.strip()]
+    complaints: List[str] = []
+    ignored: List[str] = []
+    index = 0
+    while index < len(lines):
+        if _IGNORED_PATHS_ADVICE_RE.match(lines[index]):
+            index += 1
+            while index < len(lines) and not (
+                _IGNORED_ADVICE_HINT_RE.match(lines[index])
+                or _COMPLAINT_LINE_RE.match(lines[index])
+            ):
+                if lines[index] not in ignored:
+                    ignored.append(lines[index])  # paths: ignored, not staged
+                index += 1
+            while index < len(lines) and _IGNORED_ADVICE_HINT_RE.match(lines[index]):
+                index += 1  # "Use -f …" / "Disable this message …"
+            continue
+        complaints.append(lines[index])
+        index += 1
+    return complaints, ignored
+
+
 def _stage_partial(stderr: str) -> bool:
     """Whether a stage skipped only entry-level problems.
 
     Every complaint has to be entry-level: a broken object DB, a full disk or a
-    bad pathspec must keep the stage failing closed.
+    bad pathspec must keep the stage failing closed.  The ignored-paths advisory
+    is not a complaint (see :func:`_parse_stage_stderr`): an ignored path is
+    outside the commit by design, and git still stages every other entry when it
+    prints that advisory (measured, git 2.53), so the snapshot is partial rather
+    than failed.  An advisory alongside a real complaint is not tolerated.
     """
-    complaints = [line.strip() for line in (stderr or "").splitlines() if line.strip()]
+    complaints, ignored = _parse_stage_stderr(stderr)
     if not complaints:
-        return False
-    return all(_ENTRY_LEVEL_ADD_ERR_RE.match(line) for line in complaints)
+        return bool(ignored)
+    return all(
+        _ENTRY_LEVEL_ADD_ERR_RE.match(line)
+        and len(_MSG_TOKEN_BOUNDARY_RE.findall(line)) < 2
+        for line in complaints
+    )
 
 
 def _skipped_entries(stderr: str) -> List[str]:
-    """The paths named by tolerated entry-level stage errors, for the warning."""
+    """The paths a tolerated stage problem left out, for the warning."""
     out: List[str] = []
     for line in (stderr or "").splitlines():
-        match = re.search(r"open\(\"(.*?)\"\)", line) or re.search(r"unable to stat '(.*?)'", line)
+        match = (
+            re.search(r"open\(\"(.*?)\"\)", line)
+            or re.search(r"unable to stat '(.*?)'", line)
+            or re.search(r"error: '(.*)' does not have a commit checked out", line)
+        )
         if match and match.group(1) not in out:
             out.append(match.group(1))
+    for rel in _parse_stage_stderr(stderr)[1]:
+        if rel not in out:
+            out.append(rel)
     return out
+
+
+def _ignored_paths(store: Path, working_dir: str, rel_paths: List[str]) -> Set[str]:
+    """The subset of *rel_paths* the project's ignore rules already exclude.
+
+    The pre-stage size filter hands oversize paths to ``git add`` as
+    ``:(exclude,literal)`` entries.  Git takes that for a path it would otherwise
+    add, but exits **1** printing the ignored-paths advisory when the path is
+    already ignored — so such a path must not be named in the pathspec at all.
+    It is out of the commit either way, so dropping it from the list leaves the
+    snapshot identical and removes the failure.
+
+    ``git check-ignore`` exits 0 when at least one argument matched the ignore
+    rules and 1 when none did; any other outcome (git missing, timeout, usage
+    error) means the answer is unknown, so nothing is dropped and the caller
+    keeps its fail-closed behaviour.  Paths are passed as arguments, not on stdin:
+    ``-z`` is stdin-only in git, and ``_run_git`` feeds git an empty stdin.
+    """
+    if not rel_paths:
+        return set()
+    ok, out, err = _run_git(
+        ["check-ignore", "--", *rel_paths],
+        store, working_dir,
+        allowed_returncodes={1},
+    )
+    if not ok:
+        if err:
+            logger.debug(
+                "Checkpoint: check-ignore unavailable for %s, keeping every oversize "
+                "path in the pathspec: %s", working_dir, err,
+            )
+        return set()
+    return {line.strip() for line in out.splitlines() if line.strip()}
 
 
 def _lock_holder_visible(lock_path: Path) -> bool:
@@ -1566,6 +1686,10 @@ class CheckpointManager:
         out of the committed tree exactly as the post-stage drop already made
         them.  Costs one ``stat``-walk of the project; past
         ``_MAX_PATHSPEC_EXCLUDES`` matches it gives up and returns nothing.
+        Paths the project already ignores are left out of the returned list —
+        naming one makes ``git add`` exit 1 with the ignored-paths advisory, which
+        the stage reads as a failure for the whole project (see
+        :func:`_ignored_paths`).
         """
         cap = self.max_file_size_mb * 1024 * 1024
         if cap <= 0:
@@ -1600,6 +1724,18 @@ class CheckpointManager:
         except OSError as exc:
             logger.debug("Checkpoint: oversize pre-filter walk failed for %s: %s", working_dir, exc)
             return []
+        if found:
+            # Naming an already-ignored path here would make the stage exit 1 with
+            # the ignored-paths advisory — those paths stay out of the commit
+            # either way, so they must stay out of the pathspec too.
+            ignored = _ignored_paths(_store_path(), working_dir, found)
+            if ignored:
+                logger.debug(
+                    "Checkpoint: %d oversize path(s) already ignored in %s — left out of the "
+                    "pathspec: %s", len(ignored), working_dir,
+                    ", ".join(sorted(ignored)[:5]) + ("…" if len(ignored) > 5 else ""),
+                )
+                found = [rel for rel in found if rel not in ignored]
         return [":(exclude,literal)" + rel for rel in found]
 
     def _stage(self, store: Path, working_dir: str, index_file: Path) -> Tuple[bool, str, List[str]]:
@@ -1627,8 +1763,8 @@ class CheckpointManager:
                 # still writes the index: the snapshot is usable and partial.
                 skipped = _skipped_entries(err)
                 logger.warning(
-                    "Checkpoint: %d unreadable/vanished entr%s skipped while staging %s: %s "
-                    "(absent from this snapshot; a rollback leaves them as they are)",
+                    "Checkpoint: %d entr%s skipped while staging %s (unreadable, vanished or "
+                    "ignored): %s (absent from this snapshot; a rollback leaves them as they are)",
                     len(skipped), "y" if len(skipped) == 1 else "ies", working_dir,
                     ", ".join(skipped[:5]) + ("…" if len(skipped) > 5 else ""),
                 )
