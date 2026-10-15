@@ -159,6 +159,10 @@ class _Registry(ProcessCheckpointMixin):
 
     def __init__(self, sessions):
         self._running = {s.id: s for s in sessions}
+        # Mirror the real registry: _write_checkpoint builds %s from both tables; a stub
+        # missing one raised AttributeError into the write path and swallowed the write
+        # (same failure class as heartbeat_seconds, see module docstring).
+        self._finished = {}
         self._lock = threading.Lock()
 
 
