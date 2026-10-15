@@ -20,9 +20,8 @@ class ProcessCheckpointMixin:
     # ----- Checkpoint (crash recovery) -----
 
     def _write_checkpoint(self, extra_entries: Optional[list[dict[str, Any]]] = None):
-        """Write running process metadata to the checkpoint file atomically."""
+        """Write running process metadata to each owning profile's checkpoint file atomically."""
         from tools.process_registry import _checkpoint_path, _CHECKPOINT_FIELDS
-        from utils import atomic_json_write
 
         try:
             with self._lock:
@@ -45,6 +44,7 @@ class ProcessCheckpointMixin:
                 if extra_entries:
                     tracked_ids = {item.get("session_id") for item in entries}
                     entries.extend(item for item in extra_entries if item.get("session_id") not in tracked_ids)
+                known = {*self._running, *self._finished}
                 # Group by OWNING profile -- never by the ambient HERMES_HOME at write time:
                 # each profile's file holds only its own entries (P1-e).
                 # Resolve to PATHS before writing: two entries can resolve to the same file
@@ -67,33 +67,72 @@ class ProcessCheckpointMixin:
                 written_paths = self.__dict__.setdefault("_ckpt_files_written", set())
                 written: set = set()
                 for path, items in by_path.items():
-                    try:
-                        atomic_json_write(path, items)
-                    except Exception:
-                        # One unwritable path (a stale profile home, a read-only mount) must not
-                        # abort the rest: the profiles later in this batch would lose their
-                        # checkpoint too and come back orphaned after a restart (that is exactly
-                        # what a single bogus ``profiles/<name>`` path used to do).
-                        logger.warning(
-                            "Failed to write checkpoint to %s (%d entries)", path, len(items),
-                            exc_info=True)
-                        continue
-                    written.add(path)
-                    written_paths.add(path)
+                    if self._merge_checkpoint_file(path, items, known):
+                        written.add(path)
+                        written_paths.add(path)
                 # A profile whose last process exited must go back to [] -- otherwise its
                 # file keeps ghost rows forever.  Only files this instance wrote are
-                # reset, so unrelated profiles are never touched.
+                # reset, so unrelated profiles are never touched. The reset goes through the
+                # merge as well: a bare [] would erase the handoffs the merge just preserved.
                 for path in list(written_paths):
                     if path not in written:
-                        try:
-                            atomic_json_write(path, [])
-                        except Exception:
-                            logger.warning("Failed to reset checkpoint file %s", path,
-                                           exc_info=True)
-                            continue
-                        written_paths.discard(path)
+                        if self._merge_checkpoint_file(path, [], known):
+                            written_paths.discard(path)
         except Exception as e:
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
+
+    def _merge_checkpoint_file(self, path, entries, known) -> bool:
+        """Write *path* from *entries*, keeping the handoffs on disk this registry never tracked
+        (upstream 92fec1607b0), and report whether the file was written.
+
+        ``_foreign_handoffs`` -> ``adoptable_log`` resolves the output directory from the LIVE
+        HERMES_HOME, so a target that is not this scope's own file is merged under ITS home's
+        scope -- otherwise every handoff that profile owns is judged foreign to it and deleted
+        by the very write meant to preserve it."""
+        from hermes_cli.active_sessions import _FileLock
+        from hermes_constants import (
+            get_hermes_home, reset_hermes_home_override, set_hermes_home_override,
+        )
+        from utils import atomic_json_write
+
+        path = Path(path)
+        token = None
+        try:
+            if path.parent != get_hermes_home():
+                token = set_hermes_home_override(str(path.parent))
+            with _FileLock(path.with_name(path.name + ".lock")):
+                merged = [*entries]
+                seen = {item.get("session_id") for item in merged}
+                merged.extend(item for item in self._foreign_handoffs(path, known)
+                              if item.get("session_id") not in seen)
+                atomic_json_write(path, merged)
+            return True
+        except Exception:
+            # One unwritable path (a stale profile home, a read-only mount) must not
+            # abort the rest: the profiles later in this batch would lose their
+            # checkpoint too and come back orphaned after a restart (that is exactly
+            # what a single bogus ``profiles/<name>`` path used to do).
+            logger.warning(
+                "Failed to write checkpoint to %s (%d entries)", path, len(entries),
+                exc_info=True)
+            return False
+        finally:
+            if token is not None:
+                reset_hermes_home_override(token)
+
+    def _foreign_handoffs(self, path, known) -> list[dict[str, Any]]:
+        """On-disk worker handoffs this registry never tracked whose log still decides an outcome:
+        the process is alive (same start time) or its recorded exit is waiting to be read."""
+        from pathlib import Path
+        from tools.process_registry_output_log import _exit_path, adoptable_log
+        try:
+            on_disk = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            return []
+        return [entry for entry in on_disk if isinstance(entry, dict) and entry.get("session_id") not in known
+                and (log := adoptable_log(entry.get("output_log"))) and Path(log).exists()
+                and (_exit_path(log).exists() or self._detached_host_fate(
+                    entry.get("pid"), entry.get("host_start_time")) == "running")]
 
     def recover_from_checkpoint(self) -> int:
         """On gateway startup, probe PIDs from the checkpoint file; returns how many
@@ -102,6 +141,7 @@ class ProcessCheckpointMixin:
             ProcessSession, _CHECKPOINT_FIELDS, _checkpoint_path,
             _CHECKPOINT_DEFAULTS, _WATCHER_ROUTE_KEYS, _stop_systemd_unit,
         )
+        from tools.process_registry_output_log import adoptable_log
 
         checkpoint_path = _checkpoint_path()
         if not checkpoint_path.exists():
@@ -133,6 +173,11 @@ class ProcessCheckpointMixin:
             # completion. A positive mismatch means the number was recycled:
             # do not adopt it and do not signal it.
             fate = self._detached_host_fate(pid, entry.get("host_start_time"))
+            # A worker spawn's output log and recorded exit outlive both the spawner and the PID,
+            # so its reader decides the outcome (a recycled PID is never signalled: fate != running).
+            log = adoptable_log(entry.get("output_log"))
+            if log:
+                fate = "running"
             if fate == "reused":
                 logger.info(
                     "Not recovering session %s: pid %d is alive but its "
@@ -154,10 +199,15 @@ class ProcessCheckpointMixin:
                 command=entry.get("command", "unknown"),
                 owner_task_id=entry.get("owner_task_id", "") or entry.get("task_id", ""),
                 started_at=entry.get("started_at", time.time()))
-            # detached: can't read output, but can report status + kill
+            # detached: no Popen handle, but can report status + kill; a worker spawn's output log
+            # (and recorded exit) outlives its spawner, so tail it from the start.
+            fields["output_log"] = log
             session = ProcessSession(id=entry["session_id"], detached=True, **fields)
-            with self._lock:
-                self._running[session.id] = session
+            if session.output_log:
+                self._track_started(session, self._log_reader_loop, f"proc-log-reader-{session.id}")
+            else:
+                with self._lock:
+                    self._running[session.id] = session
             recovered += 1
             logger.info("Recovered detached process: %s (pid=%d)", session.command[:60], pid)
             # Re-enqueue watcher so gateway can resume notifications
