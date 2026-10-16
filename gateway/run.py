@@ -2344,6 +2344,8 @@ class _GatewayModelContext:
     base_url: str
     context_length: int
     context_source: str
+    # Set when provider resolution fell back pre-agent: the runtime model+notice the turn will use.
+    fallback_notice: str = ""
 
 
 def _resolve_gateway_model_context(
@@ -2360,6 +2362,7 @@ def _resolve_gateway_model_context(
     from agent.model_metadata import (
         DEFAULT_CONTEXT_LENGTHS, DEFAULT_FALLBACK_CONTEXT, _longest_key_match, get_model_context_length)
     resolved_model = model or _resolve_gateway_model()
+    fallback_notice = ""
     config_context_length = provider = base_url = api_key = custom_providers = None
     configured_model = configured_provider = configured_base_url = None
 
@@ -2385,7 +2388,7 @@ def _resolve_gateway_model_context(
             custom_providers = data.get("custom_providers")
 
     def _read_runtime() -> None:
-        nonlocal provider, base_url, api_key
+        nonlocal provider, base_url, api_key, resolved_model, fallback_notice
         if route and route.get("base_url"):
             # A session route with its own endpoint (a /model switch) replaces the default runtime
             # read; a route without one (persisted / SessionDB / plain config) still resolves the
@@ -2398,6 +2401,11 @@ def _resolve_gateway_model_context(
         provider = runtime.get("provider") or provider
         base_url = runtime.get("base_url") or base_url
         api_key = runtime.get("api_key")
+        if not model and runtime.get("model"):
+            # A pre-agent fallback hands us the model this turn will actually send (#74349); show
+            # that pairing instead of mixing config's primary model with the fallback provider.
+            resolved_model = runtime["model"]
+            fallback_notice = runtime.get("_fallback_notice") or ""
 
     def _pin_still_applies() -> bool:
         # Drop a configured context_length pin when the effective route no longer matches (or on error).
@@ -2427,7 +2435,8 @@ def _resolve_gateway_model_context(
                       else "default" if fell_through else "detected")
     return _GatewayModelContext(
         model=resolved_model, provider=provider or "", base_url=base_url or "",
-        context_length=context_length, context_source=context_source)
+        context_length=context_length, context_source=context_source,
+        fallback_notice=fallback_notice)
 
 
 def _resolve_runtime_agent_kwargs_for_provider(provider: str, target_model: Optional[str] = None) -> dict:
