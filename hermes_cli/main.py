@@ -3582,10 +3582,6 @@ def main():
         parser.print_help()
 
 
-if __name__ == "__main__":
-    main()
-
-
 # A1 (fork carry#16): import-time dispatch guard lives at module end so it never
 # collides with upstream's _apply_profile_override()/pm insertion hotspot.
 def _a1_dispatch_guard_oneshot() -> None:
@@ -3624,3 +3620,7 @@ def _a1_dispatch_guard_oneshot() -> None:
 
 
 _a1_dispatch_guard_oneshot()
+
+
+if __name__ == "__main__":
+    main()
