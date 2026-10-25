@@ -279,11 +279,30 @@ def guard_dispatch(*, source: str | None = None, argv: list | None = None) -> No
     )
     if message is None:
         return
-    _audit("dispatch-block", profile_of(os.environ.get("HERMES_HOME")),
-           f"A1 硬拦跨 profile 派单：caller={_caller_profile_from_env()} "
-           f"argv={' '.join(argv if argv is not None else sys.argv)[:160]}")
+    _target = profile_of(os.environ.get("HERMES_HOME"))
+    _caller = _caller_profile_from_env()
+    _argv_txt = " ".join(argv if argv is not None else sys.argv)[:160]
+
+    # 2026-10-25 (甲′ 修②): observe-and-alert — 记录 + 告警，不再拦截。
+    # 历史：此处原为 raise SystemExit(2)。多路复用网关下 caller 被恒判为
+    # default（见 _caller_profile_from_env 的说明），硬拦杀死的是合法同档
+    # 自跑（memory 自查连续 4 天），而真正危险的「直派 default」反而被
+    # target==caller 早退静默放行、零台账零审计。执法层改为巡检
+    # K+/K++（跨通道对账 + 目标侧反向 join）；本守卫降级为绊线：
+    # 每次未登记的跨档派单必须可见。回滚开关（无需重新动核心树）：
+    #   HERMES_DISPATCH_MODE=block   ⇒ 恢复旧行为（硬拦 rc=2）
+    if os.environ.get("HERMES_DISPATCH_MODE", "observe") != "block":
+        _audit("dispatch-observe", _target,
+               f"A1 观测未登记跨 profile 派单（不拦截·甲′）：caller={_caller} "
+               f"argv={_argv_txt}")
+        _alert(f"【治理·A1 观测】{_dt.datetime.now().astimezone():%m-%d %H:%M} · 未登记跨 profile 派单"
+               f"（已放行，待巡检对账）：{_caller} → {_target}")
+        return
+
+    _audit("dispatch-block", _target,
+           f"A1 硬拦跨 profile 派单（MODE=block 回滚态）：caller={_caller} "
+           f"argv={_argv_txt}")
     _alert(f"【治理·A1 硬拦】{_dt.datetime.now().astimezone():%m-%d %H:%M} · 跨 profile 派单未登记："
-           f"{_caller_profile_from_env()} → "
-           f"{profile_of(os.environ.get('HERMES_HOME'))}（已拒绝，rc=2）")
+           f"{_caller} → {_target}（已拒绝，rc=2）")
     print(message, file=sys.stderr)
     raise SystemExit(2)
