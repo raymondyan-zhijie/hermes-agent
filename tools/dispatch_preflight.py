@@ -233,10 +233,27 @@ def evaluate(*, target_home: str | None, caller_home: str | None,
 def _caller_profile_from_env() -> str:
     """Caller profile as seen from the inherited environment.
 
-    ``HERMES_DISPATCH_CALLER_HOME`` is captured by the CLI *before* the profile
-    override rewrites HERMES_HOME; the session variables are the fallback for callers
-    whose home was never exported (``agent:main:...`` == the default profile).
+    2026-10-25 (甲′ 修①): ``HERMES_SESSION_PROFILE`` is now read FIRST.
+
+    Under the multiplex gateway every served profile inherits
+    ``HERMES_DISPATCH_CALLER_HOME`` = the root home (it is captured once at the
+    gateway's own import, before the gateway starts serving other profiles),
+    so reading it first answered ``default`` for EVERY agent shell. That
+    mis-attributed callers in both directions: same-profile self-runs were
+    read as cross-profile (12 consecutive daily memory-consolidation false
+    blocks, 2026-10-21..24) and dispatches *to* default were read as
+    same-profile (silent allow via the ``target == caller`` early return,
+    zero ledger/audit rows — reproduced 2026-10-25).
+
+    ``HERMES_SESSION_PROFILE`` is exported per served session (the terminal
+    env builder) and is authoritative for "which profile's agent runs me".
+    ``HERMES_DISPATCH_CALLER_HOME`` remains the fallback for callers that
+    only export the home (the pre-override capture it was designed for);
+    the session key and ``unknown`` keep their original meanings.
     """
+    prof = os.environ.get("HERMES_SESSION_PROFILE")
+    if prof:
+        return prof
     home = os.environ.get("HERMES_DISPATCH_CALLER_HOME")
     if home:
         return profile_of(home)
