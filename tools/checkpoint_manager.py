@@ -1055,20 +1055,70 @@ def _pre_v2_shadow_repos(base: Path) -> list[dict]:
     return out
 
 
-def _dir_file_count(path: str) -> int:
+def _count_skip_names(store: Path) -> Set[str]:
+    """First-level subtrees the project's ignore rules exclude wholesale.
+
+    The ceiling bounds the *snapshot*, but it was read off a raw
+    ``rglob('*')`` — so subtrees git never stages (``installs/``, ``cache/``,
+    ``logs/`` … per ``<store>/info/exclude``) still counted, and a tree that
+    fits the snapshot exactly could be refused.  Only anchored directory
+    patterns (``/name/``, one path segment) are treated as skippable: a glob
+    (``*.log``) or a nested path (``/profiles/*/cron/output/``) says nothing
+    about a whole first-level subtree, and guessing there would undercount a
+    real tree — the guard's failure mode must stay "refuse", never "silently
+    snapshot less than asked".
+    """
+    names: Set[str] = set()
+    for pat in DEFAULT_EXCLUDES:
+        if pat.endswith("/") and not any(ch in pat for ch in "*?["):
+            names.add(pat.rstrip("/"))
+    try:
+        text = (store / "info" / "exclude").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return names
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#") or any(ch in s for ch in "*?["):
+            continue
+        if s.startswith("/") and s.endswith("/") and s.count("/") == 2:
+            names.add(s.strip("/"))
+    return names
+
+
+def _dir_file_count(path: str, skip: Optional[Set[str]] = None) -> int:
     """Quick entry-count estimate (stops early if over _MAX_FILES).
 
-    Counts every entry ``rglob('*')`` yields — directories included — because
-    that is what the guard's ceiling has always been read against.  Returns at
+    Counts every entry a recursive walk yields — directories included, symlinked
+    directories not followed — because that is what the guard's ceiling has
+    always been read against.  ``skip`` names first-level subtrees to leave out
+    (see :func:`_count_skip_names`): they are excluded from the snapshot anyway,
+    so counting them can only refuse a tree that would have fit.  Returns at
     most ``_MAX_FILES + 1``, so a caller never sees the true count of a tree the
     guard rejects.
     """
     count = 0
+    root = Path(path)
+    skip = skip or set()
     try:
-        for _ in Path(path).rglob("*"):
-            count += 1
-            if count > _MAX_FILES:
-                return count
+        stack = [root]
+        while stack:
+            current = stack.pop()
+            try:
+                it = os.scandir(current)
+            except (PermissionError, OSError):
+                continue
+            with it:
+                for entry in it:
+                    if current == root and entry.name in skip:
+                        continue
+                    count += 1
+                    if count > _MAX_FILES:
+                        return count
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                    except OSError:
+                        continue
     except (PermissionError, OSError):
         pass
     return count
@@ -1972,7 +2022,7 @@ class CheckpointManager:
         # reading is an entry count (directories included, see _dir_file_count),
         # and the skip is reported: it produces no snapshot at all, so a quiet
         # DEBUG line here is how a working tree silently stops being protected.
-        entries = _dir_file_count(working_dir)
+        entries = _dir_file_count(working_dir, skip=_count_skip_names(store))
         if entries > _MAX_FILES:
             self._warn_snapshot_problem(
                 store, working_dir, "too_many_entries",
