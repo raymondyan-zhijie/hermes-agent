@@ -1917,6 +1917,18 @@ class CheckpointManager:
         # 注意：不得命名嵌套仓**内部**路径（那才是 rc=128 的形态），故只用 root。
         if nested_repo_roots:
             nested_rel = sorted({os.path.relpath(rp, root) for rp in nested_repo_roots})
+            # 若嵌套仓根本身落在项目已忽略的目录里（如 ``cache/``），**不能**再写进 pathspec：
+            # ``git add`` 会对每个 pathspec 条目（含 exclude）做忽略判定，命名被忽略路径即
+            # 以 rc=1 报 "The following paths are ignored …: cache"（git 2.53 实测），整个
+            # 项目再次降级为「部分快照」。这类根本来也进不了索引，直接丢弃。
+            ignored_roots = _ignored_paths(_store_path(), working_dir, nested_rel)
+            if ignored_roots:
+                logger.debug(
+                    "Checkpoint: %d nested repo root(s) already ignored in %s — left out of the "
+                    "pathspec: %s", len(ignored_roots), working_dir,
+                    ", ".join(sorted(ignored_roots)[:3]),
+                )
+                nested_rel = [rel for rel in nested_rel if rel not in ignored_roots]
             for rel in nested_rel:
                 entry = ":(exclude,literal)" + rel
                 if entry in excludes:
