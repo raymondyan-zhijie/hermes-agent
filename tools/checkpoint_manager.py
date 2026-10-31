@@ -695,7 +695,11 @@ def _ignored_paths(store: Path, working_dir: str, rel_paths: List[str]) -> Set[s
     if not rel_paths:
         return set()
     ok, out, err = _run_git(
-        ["check-ignore", "--", *rel_paths],
+        # ``core.quotePath=false``：git 默认把非 ASCII 路径名 C-quote（\345\210\235…），
+        # 返回值与传入的字面 rel 路径永不相等 ⇒ 该「已被忽略」的路径仍被写进
+        # ``:(exclude,literal)`` pathspec，``git add`` 就以 rc=1 打 ignored-paths 警告
+        # 结束（2026-10-31 实测：非 ASCII 的 mp4 每次快照都进 pathspec）。
+        ["-c", "core.quotePath=false", "check-ignore", "--", *rel_paths],
         store, working_dir,
         allowed_returncodes={1},
     )
@@ -1836,8 +1840,9 @@ class CheckpointManager:
         try:
             for dirpath, dirnames, filenames in os.walk(root):
                 # 检测嵌套仓（**在先**，避免被下方 ``dirnames`` 过滤抹掉）：
-                # 等 nested 含 ``.git`` 目录 ⇒ 不进该目录、不把其下任何路径加入 pathspec。
-                if ".git" in dirnames:
+                # 含 ``.git`` 目录且**不是工作区根**（根本身的 .git 是项目自己的仓）
+                # ⇒ 不进该目录、不把其下任何路径加入 pathspec。
+                if os.path.normpath(dirpath) != str(root) and ".git" in dirnames:
                     nested_repo_roots.add(os.path.normpath(dirpath))
                     dirnames[:] = []
                     continue
@@ -1903,7 +1908,33 @@ class CheckpointManager:
                     ", ".join(sorted(ignored)[:5]) + ("…" if len(ignored) > 5 else ""),
                 )
                 found = [rel for rel in found if rel not in ignored]
-        return [":(exclude,literal)" + rel for rel in found]
+        excludes = [":(exclude,literal)" + rel for rel in found]
+        # 嵌套仓根（gitlink / 自带 ``.git`` 的目录）：``git add -A -- .`` 会走进其中并因
+        # ``error: '<dir>/' does not have a commit checked out`` 以 rc=1 结束（git 2.53 实测），
+        # 整个工作区降级为「部分快照」——每轮固定丢掉这些条目。
+        # 命名**仓库根本身**（不带结尾斜杠）为 ``:(exclude,literal)`` 即可让 git 不进入，
+        # 且不会触发 ``Pathspec … is in submodule`` 的 rc=128（实测 rc=0）。
+        # 注意：不得命名嵌套仓**内部**路径（那才是 rc=128 的形态），故只用 root。
+        if nested_repo_roots:
+            nested_rel = sorted({os.path.relpath(rp, root) for rp in nested_repo_roots})
+            for rel in nested_rel:
+                entry = ":(exclude,literal)" + rel
+                if entry in excludes:
+                    continue
+                if len(excludes) >= _MAX_PATHSPEC_EXCLUDES:
+                    logger.warning(
+                        "Checkpoint: more than %d pathspec excludes in %s — nested-repo "
+                        "exclusion truncated; those entries may still be skipped",
+                        _MAX_PATHSPEC_EXCLUDES, working_dir,
+                    )
+                    break
+                excludes.append(entry)
+            logger.debug(
+                "Checkpoint: %d nested repo(s) excluded from the pathspec in %s: %s",
+                len(nested_rel), working_dir,
+                ", ".join(nested_rel[:3]) + ("…" if len(nested_rel) > 3 else ""),
+            )
+        return excludes
 
     def _stage(self, store: Path, working_dir: str, index_file: Path) -> Tuple[bool, str, List[str]]:
         """Stage the working tree into the per-project index.

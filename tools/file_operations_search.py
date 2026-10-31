@@ -713,7 +713,10 @@ class SearchMixin:
             return paths
 
         result = self._exec(
-            f"git -C {escaped_root} check-ignore --stdin",
+            # ``core.quotePath=false``：git 默认 C-quote 非 ASCII 路径名（\345\210\235…），
+            # 输出行与下面比对用的**字面** item_path 永不相等 ⇒ 被 .gitignore 忽略的
+            # 非 ASCII 文件仍会出现在搜索结果里（同类缺陷见 checkpoint_manager._ignored_paths）。
+            f"git -C {escaped_root} -c core.quotePath=false check-ignore --stdin",
             timeout=10,
             stdin_data="\n".join(paths),
         )
