@@ -647,6 +647,10 @@ override-dependencies = [
   # replace that requirement too, not only the vendor's upper bound.
   # Remove this line when alibabacloud-tea-openapi lifts the cap.
   "cryptography==50.0.2",
+  # Local (host-custom 2026-11-03): the upstream documents extra pins pypdf==6.21.2,
+  # while the ha-deps-docs plugin pins 6.21.4 for three HIGH fixes. The workspace
+  # lock resolves every extra, so the exact pins must agree; override the extra.
+  "pypdf==6.21.4",
   # browser-harness 0.1.13 (core dependency, latest release) pins
   # pillow==12.3.0 exactly, which holds Pillow below 13.0.0, the first
   # release fixing GHSA-8g5g-8vmr-9782, GHSA-w889-685w-c8fh and the rest of
