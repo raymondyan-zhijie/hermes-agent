@@ -651,10 +651,6 @@ override-dependencies = [
   # while the ha-deps-docs plugin pins 6.21.4 for three HIGH fixes. The workspace
   # lock resolves every extra, so the exact pins must agree; override the extra.
   "pypdf==6.21.4",
-  # Local (host-custom 2026-11-03): google-meet ships playwright==1.64.0, whose managed
-  # browser is Chromium 1248; this host keeps the PM-installed Chromium 1208 and the
-  # ha-deps-browser pin at 1.62.0. google-meet is never installed here.
-  "playwright==1.62.0; sys_platform != 'android'",
   # browser-harness 0.1.13 (core dependency, latest release) pins
   # pillow==12.3.0 exactly, which holds Pillow below 13.0.0, the first
   # release fixing GHSA-8g5g-8vmr-9782, GHSA-w889-685w-c8fh and the rest of
