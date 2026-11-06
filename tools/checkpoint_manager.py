@@ -282,17 +282,56 @@ def _store_pathspecs(base: Path, working_dir) -> list[str]:
     return [rel.as_posix(), lock.as_posix()]
 
 
-def _stage_all_args(base: Path, working_dir) -> list[str]:
-    """``git add -A`` that never stages the checkpoint base itself.
+def _nested_repo_roots(working_dir) -> list[str]:
+    """Relative POSIX paths of nested repos (dirs holding ``.git``) under the workspace.
+
+    ``git add -A`` dies on a nested repo with an unborn HEAD (``<dir>/ does not have a
+    commit checked out``, rc=128) — e2e fixtures under ``kanban/attachments/**`` do this,
+    and it kills the whole project's snapshot. Nested repos are never snapshot content
+    (git keeps only a gitlink), so excluding them is loss-free.
+    """
+    root = os.path.normpath(str(_normalize_path(working_dir)))
+    found: list[str] = []
+    try:
+        for dirpath, dirnames, _files in os.walk(root):
+            if os.path.normpath(dirpath) != root and ".git" in dirnames:
+                found.append(os.path.relpath(dirpath, root).replace(os.sep, "/"))
+                dirnames[:] = []
+                continue
+            dirnames[:] = [
+                d for d in dirnames if d not in (".git", ".hg", ".svn", ".worktrees")
+            ]
+    except OSError:
+        return []
+    return found
+
+
+def _stage_all_args(base: Path, working_dir, store: Optional[Path] = None) -> list[str]:
+    """``git add -A`` that stages neither the checkpoint base nor nested repos.
 
     With HERMES_HOME (or a profile home) as the working directory the store sits inside
     the snapshotted tree: every snapshot then staged the previous one's packfiles and
     index, the store grew by about its own size per checkpoint, and the eventual
     ``add -A`` timeout left ``indexes/<hash>.lock`` behind. Exclude the base and its
     ``store_lock`` file by pathspec, which works at any nesting depth without rewriting
-    the store's ``info/exclude``.
+    the store's ``info/exclude``. Nested repos are excluded for the reason in
+    :func:`_nested_repo_roots`, minus the ones the project already ignores — naming an
+    ignored path makes ``git add`` exit non-zero with the ignored-paths advisory.
     """
-    return ["add", "-A", *_exclude_store_args(base, working_dir)]
+    specs: list[str] = [
+        *_store_pathspecs(base, working_dir),
+        *_nested_repo_roots(working_dir),
+    ]
+    if store is not None and specs:
+        # Naming an ignored path makes `git add` exit non-zero with the
+        # ignored-paths advisory, even though the path is outside the commit
+        # anyway. Drop those specs (same convention as _oversize_excludes).
+        ignored = _ignored_paths(store, working_dir, specs)
+        if ignored:
+            specs = [p for p in specs if p not in ignored]
+    if not specs:
+        return ["add", "-A"]
+    return ["add", "-A", "--", *(f":(exclude){p}" for p in specs)]
 
 
 def _exclude_store_args(base: Path, working_dir) -> list[str]:
@@ -1398,7 +1437,7 @@ class CheckpointManager:
         index_file = _index_path(store, dir_hash)
 
         # Stage the current tree so the name-only diff sees new files too.
-        _run_git(_stage_all_args(store.parent, abs_dir), store, abs_dir,
+        _run_git(_stage_all_args(store.parent, abs_dir, store), store, abs_dir,
                  timeout=_GIT_STAGE_TIMEOUT, index_file=index_file)
         ok, names_out, err = _run_git(
             ["diff", "--name-only", "-z", commit_hash, "--cached",
@@ -1580,7 +1619,7 @@ class CheckpointManager:
         index_file = _index_path(store, dir_hash)
 
         # Stage current state into the per-project index to compare.
-        _run_git(_stage_all_args(store.parent, abs_dir), store, abs_dir,
+        _run_git(_stage_all_args(store.parent, abs_dir, store), store, abs_dir,
                  timeout=_GIT_STAGE_TIMEOUT, index_file=index_file)
 
         # A checkpoint taken before the store was excluded may still contain it; never
@@ -2377,7 +2416,7 @@ class CheckpointManager:
         self, store: Path, working_dir: str, index_file: Path,
     ) -> tuple[bool, str]:
         """Stage the worktree without opening files already over the size cap."""
-        add_args = _stage_all_args(store.parent, working_dir)
+        add_args = _stage_all_args(store.parent, working_dir, store)
         # Host-custom: keep partial snapshots for unreadable entries (upstream exits non-zero).
         add_args.insert(1, "--ignore-errors")
         oversize_pathspec: Optional[Path] = None
@@ -2388,8 +2427,22 @@ class CheckpointManager:
             if oversize:
                 # git refuses command-line pathspecs beside --pathspec-from-file, so the
                 # store self-exclusion rides in the same file.
-                oversize_pathspec = self._write_oversize_pathspec(
-                    oversize + _store_pathspecs(store.parent, working_dir))
+                excl = (
+                    oversize
+                    + _store_pathspecs(store.parent, working_dir)
+                    # Nested repos (unborn HEAD) ride in the same file: git refuses
+                    # command-line pathspecs beside --pathspec-from-file, and omitting
+                    # them fails the whole project's staging (e2e fixtures).
+                    + _nested_repo_roots(working_dir)
+                )
+                # Naming an already-ignored path makes `git add` exit non-zero
+                # ("paths are ignored", hint: use -f) even though everything else
+                # staged fine — drop those entries (they are outside the commit by
+                # definition, so the exclusion is redundant).
+                ignored = _ignored_paths(store, working_dir, excl)
+                if ignored:
+                    excl = [p for p in excl if p not in ignored]
+                oversize_pathspec = self._write_oversize_pathspec(excl)
                 add_args = ["add", "-A", "--ignore-errors"]
                 add_args.extend([
                     f"--pathspec-from-file={oversize_pathspec}",
