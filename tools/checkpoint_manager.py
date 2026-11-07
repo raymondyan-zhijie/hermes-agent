@@ -325,7 +325,7 @@ def _stage_all_args(base: Path, working_dir, store: Optional[Path] = None) -> li
     if store is not None and specs:
         # Naming an ignored path makes `git add` exit non-zero with the
         # ignored-paths advisory, even though the path is outside the commit
-        # anyway. Drop those specs (same convention as _oversize_excludes).
+        # anyway. Drop those specs (same convention as the oversize pre-filter).
         ignored = _ignored_paths(store, working_dir, specs)
         if ignored:
             specs = [p for p in specs if p not in ignored]
@@ -677,7 +677,7 @@ _IGNORED_ADVICE_HINT_RE = re.compile(r"^hint: ")
 # A file whose *name* starts with ``error:``/``fatal:`` is therefore read as a
 # complaint instead of as an ignored path: the stage then stays fail-closed, which
 # is the safe direction (no wrong snapshot; the pre-stage filter in
-# :meth:`_oversize_excludes` is what removes the advisory in the first place).
+# :meth:`_oversize_paths_for_staging` is what removes the advisory in the first place).
 _COMPLAINT_LINE_RE = re.compile(r"^(?:error|fatal|warning|usage|BUG):")
 
 # （乙取向 · 2026-10-12）git 的**通知行**：``warning:`` 前缀（如嵌套仓
@@ -728,7 +728,7 @@ def _parse_stage_stderr(stderr: str) -> Tuple[List[str], List[str]]:
     # NOTE (measured, git 2.53): the advisory's path lines are git's own
     # short-form pathspec echo — for a path that is ignored, that is the plain
     # relative path (no ``:(exclude,literal)`` prefix, no leading ``./``), which is
-    # what :meth:`_oversize_excludes` names in the pathspec.
+    # what :meth:`_oversize_paths_for_staging` names in the pathspec.
     lines = [line.strip() for line in (stderr or "").splitlines() if line.strip()]
     complaints: List[str] = []
     ignored: List[str] = []
@@ -1985,148 +1985,6 @@ class CheckpointManager:
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
-
-    def _oversize_excludes(self, working_dir: str) -> List[str]:
-        """Pathspec exclusions for files above ``max_file_size_mb``.
-
-        The cap is enforced after staging, by dropping oversize paths from the
-        index — but ``git add`` has already hashed and written those blobs into
-        the object DB by then, so a 353 MB bundle costs its full size, and its
-        share of the shared store, on every first snapshot.  Excluding them from
-        the pathspec keeps the bytes out of the object database; the paths stay
-        out of the committed tree exactly as the post-stage drop already made
-        them.  Costs one ``stat``-walk of the project; past
-        ``_MAX_PATHSPEC_EXCLUDES`` matches it gives up and returns nothing.
-        Paths the project already ignores are left out of the returned list —
-        naming one makes ``git add`` exit 1 with the ignored-paths advisory, which
-        the stage reads as a failure for the whole project (see
-        :func:`_ignored_paths`).
-        """
-        cap = self.max_file_size_mb * 1024 * 1024
-        if cap <= 0:
-            return []
-        root = _normalize_path(working_dir)
-        found: List[str] = []
-        # 嵌套仓（nested repo / gitlink）：其下任何路径都不能进入 ``:(exclude,literal)``
-        # pathspec —— git 2.53 实测：``git add -A -- :(exclude,literal)<sub>/<file>`` 在
-        # ``<sub>`` 是嵌套仓（parent 是 160000 gitlink 或 ``<sub>/.git`` 在）时会 ``rc=128``
-        # 并打印 ``fatal: Pathspec ':(exclude,literal)<sub>/<file>' is in submodule '<sub>'``，
-        # 整项 ``git add`` 失败 ⇒ 该工作区所有新快照静默全停（D3 线 · t_136980fe）。
-        # ``git check-ignore`` 对这类路径自身也 ``rc=128 fatal``，无法救场 ⇒ 必须在
-        # pathspec 构造点处理。识别口径：从 root 起 os.walk 时遇到含 ``.git`` 的目录，
-        # 即视为嵌套仓、**不进该目录、不把其下任何路径加入 pathspec**（嵌套仓本身的
-        # 文件不属本工作区快照对象，由嵌套仓自己负责）。
-        nested_repo_roots: Set[str] = set()
-        try:
-            for dirpath, dirnames, filenames in os.walk(root):
-                # 检测嵌套仓（**在先**，避免被下方 ``dirnames`` 过滤抹掉）：
-                # 含 ``.git`` 目录且**不是工作区根**（根本身的 .git 是项目自己的仓）
-                # ⇒ 不进该目录、不把其下任何路径加入 pathspec。
-                if os.path.normpath(dirpath) != str(root) and ".git" in dirnames:
-                    nested_repo_roots.add(os.path.normpath(dirpath))
-                    dirnames[:] = []
-                    continue
-                dirnames[:] = [
-                    d for d in dirnames
-                    if d not in (".git", ".hg", ".svn", ".worktrees")
-                ]
-                for name in filenames:
-                    candidate = os.path.join(dirpath, name)
-                    try:
-                        # ``stat`` (not ``lstat``) to agree with
-                        # :meth:`_exceeds_size_cap`, which measures the target.
-                        if os.stat(candidate).st_size <= cap:
-                            continue
-                    except OSError:
-                        continue
-                    rel = os.path.relpath(candidate, root)
-                    if rel not in found:
-                        found.append(rel)
-                    if len(found) > _MAX_PATHSPEC_EXCLUDES:
-                        logger.warning(
-                            "Checkpoint: more than %d oversize files in %s — skipping the "
-                            "pre-stage size filter; the post-stage drop still applies",
-                            _MAX_PATHSPEC_EXCLUDES, working_dir,
-                        )
-                        return []
-        except OSError as exc:
-            logger.debug("Checkpoint: oversize pre-filter walk failed for %s: %s", working_dir, exc)
-            return []
-        if nested_repo_roots:
-            # rfb-Δ1（复核 rfb2 发现）：第二重剔除原判据用绝对 ``rp`` 匹配相对 ``rel``，恒 False
-            # ⇒ 属空保险。改为先取 ``root`` 相对基准 ``rn``（与 ``found`` 收集的 ``rel`` 同基准），
-            # ``rel == rn``（仓库根名场景）或 ``rel.startswith(rn + os.sep)``（子路径）。
-            _nested_rel = sorted(
-                os.path.relpath(rp, root) for rp in nested_repo_roots
-            )
-            before = len(found)
-            found = [
-                rel for rel in found
-                if not any(
-                    rel == rn or rel.startswith(rn + os.sep)
-                    for rn in _nested_rel
-                )
-            ]
-            dropped = before - len(found)
-            if dropped:
-                logger.debug(
-                    "Checkpoint: %d oversize path(s) live under nested repo(s) in %s — left "
-                    "out of the pathspec (git fatal on submodule pathspec entries): %s",
-                    dropped, working_dir,
-                    ", ".join(sorted(nested_repo_roots)[:3])
-                    + ("…" if len(nested_repo_roots) > 3 else ""),
-                )
-        if found:
-            # Naming an already-ignored path here would make the stage exit 1 with
-            # the ignored-paths advisory — those paths stay out of the commit
-            # either way, so they must stay out of the pathspec too.
-            ignored = _ignored_paths(_store_path(), working_dir, found)
-            if ignored:
-                logger.debug(
-                    "Checkpoint: %d oversize path(s) already ignored in %s — left out of the "
-                    "pathspec: %s", len(ignored), working_dir,
-                    ", ".join(sorted(ignored)[:5]) + ("…" if len(ignored) > 5 else ""),
-                )
-                found = [rel for rel in found if rel not in ignored]
-        excludes = [":(exclude,literal)" + rel for rel in found]
-        # 嵌套仓根（gitlink / 自带 ``.git`` 的目录）：``git add -A -- .`` 会走进其中并因
-        # ``error: '<dir>/' does not have a commit checked out`` 以 rc=1 结束（git 2.53 实测），
-        # 整个工作区降级为「部分快照」——每轮固定丢掉这些条目。
-        # 命名**仓库根本身**（不带结尾斜杠）为 ``:(exclude,literal)`` 即可让 git 不进入，
-        # 且不会触发 ``Pathspec … is in submodule`` 的 rc=128（实测 rc=0）。
-        # 注意：不得命名嵌套仓**内部**路径（那才是 rc=128 的形态），故只用 root。
-        if nested_repo_roots:
-            nested_rel = sorted({os.path.relpath(rp, root) for rp in nested_repo_roots})
-            # 若嵌套仓根本身落在项目已忽略的目录里（如 ``cache/``），**不能**再写进 pathspec：
-            # ``git add`` 会对每个 pathspec 条目（含 exclude）做忽略判定，命名被忽略路径即
-            # 以 rc=1 报 "The following paths are ignored …: cache"（git 2.53 实测），整个
-            # 项目再次降级为「部分快照」。这类根本来也进不了索引，直接丢弃。
-            ignored_roots = _ignored_paths(_store_path(), working_dir, nested_rel)
-            if ignored_roots:
-                logger.debug(
-                    "Checkpoint: %d nested repo root(s) already ignored in %s — left out of the "
-                    "pathspec: %s", len(ignored_roots), working_dir,
-                    ", ".join(sorted(ignored_roots)[:3]),
-                )
-                nested_rel = [rel for rel in nested_rel if rel not in ignored_roots]
-            for rel in nested_rel:
-                entry = ":(exclude,literal)" + rel
-                if entry in excludes:
-                    continue
-                if len(excludes) >= _MAX_PATHSPEC_EXCLUDES:
-                    logger.warning(
-                        "Checkpoint: more than %d pathspec excludes in %s — nested-repo "
-                        "exclusion truncated; those entries may still be skipped",
-                        _MAX_PATHSPEC_EXCLUDES, working_dir,
-                    )
-                    break
-                excludes.append(entry)
-            logger.debug(
-                "Checkpoint: %d nested repo(s) excluded from the pathspec in %s: %s",
-                len(nested_rel), working_dir,
-                ", ".join(nested_rel[:3]) + ("…" if len(nested_rel) > 3 else ""),
-            )
-        return excludes
 
     def _stage(self, store: Path, working_dir: str, index_file: Path) -> Tuple[bool, str, List[str]]:
         """Stage the working tree into the per-project index.
