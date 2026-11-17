@@ -221,8 +221,12 @@ def _osv_fetch_details(vuln_ids: Iterable[str]) -> dict[str, Vulnerability]:
     def _fetch_one(vid: str) -> Vulnerability:
         try:
             rec = _http_json(OSV_VULN_URL.format(vid=vid))
-        except _HTTP_ERRORS:
-            return Vulnerability(osv_id=vid)
+        except _HTTP_ERRORS as exc:
+            # carried patch (2026-11-15, kanban t_464aa127): detail failures must be loud.
+            # Returning a bare Vulnerability() here silently downgraded a fixable HIGH to
+            # severity=UNKNOWN / fixed_versions=[] and corrupted the "fixable M" count, while a
+            # failed *batch* query already raises. Same 口径 both ways: partial == failed.
+            raise RuntimeError(f"OSV detail query failed for {vid}: {exc}") from exc
         return Vulnerability(vid, _osv_severity_from_record(rec), (rec.get("summary") or "").strip(), _osv_fixed_versions(rec))
 
     unique = sorted({vid for vid in vuln_ids if vid})
