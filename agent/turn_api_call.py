@@ -248,9 +248,12 @@ def nous_rate_limit_guard(
     # 402 + cache-invalidating switch. Only while still on the primary; fail open.
     if not getattr(agent, "_fallback_activated", False):
         try:
-            from agent.billing_cooldown import agent_credential_hint, billing_cooldown_remaining
+            from agent.billing_cooldown import (
+                agent_credential_hint, agent_credential_id, billing_cooldown_remaining,
+            )
             _bill_rem = billing_cooldown_remaining(
-                agent.provider, getattr(agent, "base_url", ""), api_key=agent_credential_hint(agent))
+                agent.provider, getattr(agent, "base_url", ""), api_key=agent_credential_hint(agent),
+                credential_id=agent_credential_id(agent))
             if _bill_rem is not None and _bill_rem > 0:
                 # FailoverReason is already imported at module scope; a local re-import
                 # here would shadow it for the whole function and UnboundLocal the Nous

@@ -52,12 +52,23 @@ def _state_path() -> str:
 
 
 def agent_credential_hint(agent: Any) -> str:
-    """Extract the live credential string from *agent* without mutating state."""
-    return str(
-        getattr(agent, "api_key", None)
-        or getattr(agent, "_anthropic_api_key", None)
-        or ""
-    ).strip()
+    """Extract the live credential string from *agent* without mutating state.
+
+    ``api_key`` may be a callable (Entra ID and other refreshable credentials); resolving it
+    here keeps the sidecar key stable across processes instead of hashing ``str(callable)``.
+    """
+    raw = getattr(agent, "api_key", None) or getattr(agent, "_anthropic_api_key", None)
+    if callable(raw):
+        try:
+            raw = raw()
+        except Exception:
+            raw = ""
+    return str(raw or "").strip()
+
+
+def agent_credential_id(agent: Any) -> str:
+    """Stable pool-entry id when the route has one; empty for env-key routes."""
+    return str(getattr(agent, "_credential_pool_entry_id", "") or "").strip()
 
 
 def _credential_identity(provider: str, api_key: str = "", credential_id: str = "") -> str:

@@ -92,10 +92,13 @@ def _arm_rate_limit_cooldown(
     # instead of each re-burning a 402 + cache-invalidating fallback. Fail open.
     if reason == FailoverReason.billing:
         try:
-            from agent.billing_cooldown import agent_credential_hint, record_billing_cooldown
+            from agent.billing_cooldown import (
+                agent_credential_hint, agent_credential_id, record_billing_cooldown,
+            )
             record_billing_cooldown(
                 getattr(agent, "provider", ""), getattr(agent, "base_url", ""),
-                api_key=agent_credential_hint(agent), reset_at=reset_at)
+                api_key=agent_credential_hint(agent), credential_id=agent_credential_id(agent),
+                reset_at=reset_at)
         except Exception:
             logger.debug("shared billing cooldown record failed", exc_info=True)
     return backoff_seconds

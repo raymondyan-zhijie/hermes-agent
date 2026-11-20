@@ -14,6 +14,7 @@ import time
 from typing import Any, Dict, Optional
 
 from agent.error_classifier import FailoverReason
+from agent.prompt_cache_lifecycle import start_prompt_cache_warming
 from agent.turn_api_call import stop_thinking_spinner
 from agent.turn_failure_copy import invalid_response_failure_reason, provider_label_for, site_copy, stamp_failure
 from agent.turn_truncation import handle_content_policy_refusal, recover_from_truncation
@@ -206,6 +207,9 @@ def check_api_response(
     if _usage_outcome.rearmed:
         _preflight_compression_blocked = False
         _last_preflight_pressure = None
+    # Arm a bounded replay (smallest output cap) of THIS request before the clock's guaranteed window
+    # ends, so a tool round longer than the TTL does not turn the next request into a full-price cache write.
+    start_prompt_cache_warming(agent, api_kwargs, response)
 
     _retry.has_retried_429 = False
     # Clearing Nous rate-limit state proves the limit reset so other sessions may resume.
@@ -219,9 +223,12 @@ def check_api_response(
     # A successful call on this route proves the account can serve again: lift any
     # shared billing cooldown so sibling instances resume the primary. Fail open.
     try:
-        from agent.billing_cooldown import agent_credential_hint, clear_billing_cooldown
+        from agent.billing_cooldown import (
+            agent_credential_hint, agent_credential_id, clear_billing_cooldown,
+        )
         clear_billing_cooldown(
-            agent.provider, getattr(agent, "base_url", ""), api_key=agent_credential_hint(agent))
+            agent.provider, getattr(agent, "base_url", ""), api_key=agent_credential_hint(agent),
+            credential_id=agent_credential_id(agent))
     except Exception:
         pass
     from agent import relay_llm
