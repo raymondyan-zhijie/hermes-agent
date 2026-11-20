@@ -117,6 +117,10 @@ def _apply_char_budget(result_dict: dict, content: str, offset: int, total_lines
 
 # Above this size, a wide read (limit > 200) gets a hint toward targeted reads.
 _LARGE_FILE_HINT_BYTES = 512_000
+# A wide read of a file with more lines than this gets a targeted-read hint even
+# when the file is under _LARGE_FILE_HINT_BYTES and nothing was truncated — the
+# 15–98 KB / 300–2000-line band that otherwise re-injects whole files silently.
+_WIDE_READ_HINT_LINES = 300
 
 def _file_ops_uses_host_paths(file_ops) -> bool:
     """True when *file_ops* targets the host filesystem (only then may we stat paths
@@ -731,6 +735,16 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
                 "to keep context usage efficient."))
 
         total_lines = result_dict.get("total_lines")
+        # Wide read of a multi-hundred-line file that fit entirely in the response:
+        # no truncation fires, so without this the whole file re-enters context with
+        # no nudge toward search_files + offset/limit. Never clobber an existing hint.
+        if (isinstance(total_lines, int) and total_lines > _WIDE_READ_HINT_LINES
+                and limit >= 500 and not result_dict.get("truncated")
+                and "_hint" not in result_dict):
+            result_dict["_hint"] = (
+                f"This file has {total_lines} lines and you read it with a wide limit "
+                f"({limit}). To keep context lean, locate the section you need with "
+                "search_files first, then read_file with a targeted offset/limit.")
         if result_dict.get("truncated_by") == "bytes":
             end_line = int(result_dict.get("next_offset", offset)) - 1
         else:

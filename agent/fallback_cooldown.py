@@ -87,6 +87,17 @@ def _arm_rate_limit_cooldown(
         "Rate-limit backoff level %d: cooldown %d s (%.1f min, backoff#%d, %s)",
         backoff_count, backoff_seconds, backoff_seconds / 60, backoff_count + 1, source,
     )
+    # A billing (402) refusal is account-level and outlives this instance: persist a
+    # shared cooldown so sibling sessions / fresh workers skip the benched primary
+    # instead of each re-burning a 402 + cache-invalidating fallback. Fail open.
+    if reason == FailoverReason.billing:
+        try:
+            from agent.billing_cooldown import agent_credential_hint, record_billing_cooldown
+            record_billing_cooldown(
+                getattr(agent, "provider", ""), getattr(agent, "base_url", ""),
+                api_key=agent_credential_hint(agent), reset_at=reset_at)
+        except Exception:
+            logger.debug("shared billing cooldown record failed", exc_info=True)
     return backoff_seconds
 
 

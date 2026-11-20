@@ -216,6 +216,14 @@ def check_api_response(
             clear_nous_rate_limit(anonymous=is_anonymous_agent(agent))
         except Exception:
             pass
+    # A successful call on this route proves the account can serve again: lift any
+    # shared billing cooldown so sibling instances resume the primary. Fail open.
+    try:
+        from agent.billing_cooldown import agent_credential_hint, clear_billing_cooldown
+        clear_billing_cooldown(
+            agent.provider, getattr(agent, "base_url", ""), api_key=agent_credential_hint(agent))
+    except Exception:
+        pass
     from agent import relay_llm
 
     relay_llm.complete_logical_call(api_request_id, outcome="success")

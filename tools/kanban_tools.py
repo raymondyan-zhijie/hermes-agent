@@ -678,9 +678,34 @@ def inject_new_comments_from_env(agent: Any) -> bool:
 
 # --- Handlers ---
 
+def _fold_heartbeat_events(events: list, *, keep: int = 30) -> list:
+    """Read-side projection: collapse heartbeat noise into one summary row.
+
+    Heartbeats are liveness ticks, not decisions. A long run can fill the whole
+    event window with them and bury the state transitions a reader actually
+    needs (observed: 40 of the last 50 events were heartbeats). Keep the newest
+    ``keep`` non-heartbeat events in order and represent every heartbeat in the
+    window as a single ``heartbeat_summary`` row (count + latest note). The DB
+    is never mutated — this only shapes what ``kanban_show`` returns.
+    """
+    kept, hb = [], []
+    for e in events:
+        (hb if e.kind == "heartbeat" else kept).append(e)
+    rows = [_fields(e, _EVENT_FIELDS) for e in kept[-keep:]]
+    if hb:
+        latest = max(hb, key=lambda e: e.created_at)
+        rows.append({
+            "kind": "heartbeat_summary",
+            "payload": {"count": len(hb), "latest_note": (latest.payload or {}).get("note")},
+            "created_at": latest.created_at,
+            "run_id": latest.run_id,
+        })
+    return rows
+
+
 @_kanban_handler("kanban_show")
 def _handle_show(args: dict, **kw) -> str:
-    """Full task state: row, parents, children, comments, runs, last 50 events."""
+    """Full task state: row, parents, children, comments, runs, folded events."""
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         # No dispatcher task in scope and no explicit id: the caller asked "what
@@ -693,9 +718,15 @@ def _handle_show(args: dict, **kw) -> str:
                 "task to show by default. Call kanban_list to see task ids on "
                 "the board, then kanban_show(task_id=<id>) for full state."),
         })
+    # Opt-in slim mode: worker_context re-renders body/comments/runs already
+    # present as structured fields, so a reader that only needs the structured
+    # state can drop the duplicate prose. Default stays True (workers rely on it).
+    include_worker_context = _parse_bool_arg(args, "include_worker_context")
+    if args.get("include_worker_context") is None:
+        include_worker_context = True
     with _board(args.get("board")) as (kb, conn):
         task = _existing_task(kb, conn, tid)
-        return json.dumps({
+        out = {
             "task": _fields(task, _TASK_FIELDS),
             "parents": kb.parent_ids(conn, tid),
             # Non-terminal parents; on a running card this means the dependency
@@ -704,11 +735,14 @@ def _handle_show(args: dict, **kw) -> str:
                 {"id": pid, "status": status} for pid, status in kb.unsatisfied_parents(conn, tid)],
             "children": kb.child_ids(conn, tid),
             "comments": [_fields(c, _COMMENT_FIELDS) for c in kb.list_comments(conn, tid)],
-            # Capped; full log via CLI.
-            "events": [_fields(e, _EVENT_FIELDS) for e in kb.list_events(conn, tid)[-50:]],
+            # Capped + heartbeat-folded; full log via CLI.
+            "events": _fold_heartbeat_events(kb.list_events(conn, tid)[-200:]),
             "runs": [_fields(r, _RUN_FIELDS) for r in kb.list_runs(conn, tid)],
+        }
+        if include_worker_context:
             # Same string build_worker_context hands the dispatcher at spawn time.
-            "worker_context": kb.build_worker_context(conn, tid)})
+            out["worker_context"] = kb.build_worker_context(conn, tid)
+        return json.dumps(out)
 
 
 @_kanban_handler("kanban_list")

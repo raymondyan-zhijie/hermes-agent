@@ -57,6 +57,11 @@ KANBAN_SHOW_SCHEMA = _schema(
     ),
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
+        "include_worker_context": _prop("boolean", (
+            "Optional. Default true. The worker_context string re-renders the "
+            "body/comments/runs already returned as structured fields; set false "
+            "to drop that duplicate prose when you only need the structured state "
+            "(smaller response). Dispatcher workers should keep the default.")),
     },
     [],
 )

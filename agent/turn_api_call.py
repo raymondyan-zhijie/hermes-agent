@@ -243,6 +243,30 @@ def nous_rate_limit_guard(
             compression_attempts=compression_attempts, result=result,
         )
 
+    # Shared billing cooldown (any provider): a sibling session/worker benched this
+    # account after a 402. Skip the primary call and fall back BEFORE burning another
+    # 402 + cache-invalidating switch. Only while still on the primary; fail open.
+    if not getattr(agent, "_fallback_activated", False):
+        try:
+            from agent.billing_cooldown import agent_credential_hint, billing_cooldown_remaining
+            _bill_rem = billing_cooldown_remaining(
+                agent.provider, getattr(agent, "base_url", ""), api_key=agent_credential_hint(agent))
+            if _bill_rem is not None and _bill_rem > 0:
+                # FailoverReason is already imported at module scope; a local re-import
+                # here would shadow it for the whole function and UnboundLocal the Nous
+                # branch below whenever this billing path does not run.
+                agent._buffer_diagnostic_status(
+                    f"⏳ Primary billing cooldown active (~{int(_bill_rem)}s left); trying fallback...")
+                if agent._try_activate_fallback(reason=FailoverReason.billing):
+                    logger.warning("%sShared billing cooldown active — switched to fallback", agent.log_prefix)
+                    active_system_prompt = _arm_fallback_restart(
+                        agent, api_messages, active_system_prompt, _retry)
+                    retry_count = 0
+                    compression_attempts = 0
+                    return _verdict("break")
+        except Exception:
+            pass  # never let the billing guard break the agent loop
+
     if agent.provider == "nous":
         # A gateway ``x-nous-model-switch`` recorded on the previous response moves this session
         # (and the config default, when it still names the free tier's model) before the next call.

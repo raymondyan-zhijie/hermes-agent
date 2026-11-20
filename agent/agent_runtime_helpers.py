@@ -1410,6 +1410,17 @@ def restore_primary_runtime(agent) -> bool:
         return False
     primary_runtime_base_url = str((rt or {}).get("base_url") or "")
 
+    # Shared billing cooldown: a sibling session/worker may have benched this account
+    # after our last turn. Stay on fallback instead of restoring into a guaranteed 402.
+    # Fail open — a broken sidecar must never delay recovery.
+    try:
+        from agent.billing_cooldown import billing_cooldown_remaining
+        primary_api_key = str((rt or {}).get("api_key") or (rt or {}).get("anthropic_api_key") or "")
+        if billing_cooldown_remaining(primary_provider, primary_runtime_base_url, api_key=primary_api_key) is not None:
+            return False
+    except Exception:
+        logger.debug("shared billing cooldown restore gate failed", exc_info=True)
+
     def _matches_primary(candidate) -> bool:
         return credential_pool_matches_provider(candidate, primary_provider, base_url=primary_runtime_base_url)
 
