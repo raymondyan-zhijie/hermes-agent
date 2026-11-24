@@ -386,6 +386,12 @@ def _channel_config_paths(raw: dict, platforms: Iterable[str]) -> list[tuple[str
 
 
 def strip_channel_config(config_path: Path, index: Optional[ChannelKeyIndex] = None) -> list[str]:
+    from hermes_cli.config import _config_write_lock
+    with _config_write_lock(config_path):
+        return _strip_channel_config_locked(config_path, index)
+
+
+def _strip_channel_config_locked(config_path: Path, index: Optional[ChannelKeyIndex] = None) -> list[str]:
     """Remove platform sections from a raw ``config.yaml`` in place. Returns the dotted paths removed."""
     from hermes_cli.config_backend import config_exists
     if not config_exists(config_path):

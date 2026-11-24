@@ -1921,6 +1921,14 @@ _MISSING = object()
 
 
 def persist_model_selection(result: ModelSwitchResult, config_path: Any = None) -> None:
+    from pathlib import Path
+    from hermes_cli.config import _config_write_lock, get_config_path
+    path = Path(config_path) if config_path else get_config_path()
+    with _config_write_lock(path):
+        return _persist_model_selection_locked(result, config_path)
+
+
+def _persist_model_selection_locked(result: ModelSwitchResult, config_path: Any = None) -> None:
     """Write a successful :func:`switch_model` result to ``config_path`` (default:
     ``HERMES_HOME/config.yaml`` — the context override or ``HERMES_HOME`` at call time).
 

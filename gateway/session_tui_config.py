@@ -152,21 +152,23 @@ def _write_profile_config(connection, edit):
     from hermes_cli.config import atomic_config_replace, get_config_path, read_user_config_raw
     with _profile_runtime_scope(Path(connection.authority.profile_id)), _WRITE_LOCK:
         path = get_config_path()
-        try:
-            cfg = read_user_config_raw(path)
-        except Exception as exc:  # unparseable: never overwrite the user's file
-            raise AuthorityRefusal('storage_unavailable') from exc
-        before = copy.deepcopy(cfg)
-        result, written = edit(cfg)
-        from hermes_cli.managed_scope import managed_config_keys
-        if pinned := sorted(managed_config_keys().intersection(written)):
-            raise _managed_refusal(pinned[0])
-        if cfg != before:
+        from hermes_cli.config import _config_write_lock
+        with _config_write_lock(path):
             try:
-                atomic_config_replace(path, cfg)
-            except Exception as exc:
+                cfg = read_user_config_raw(path)
+            except Exception as exc:  # unparseable: never overwrite the user's file
                 raise AuthorityRefusal('storage_unavailable') from exc
-        return result
+            before = copy.deepcopy(cfg)
+            result, written = edit(cfg)
+            from hermes_cli.managed_scope import managed_config_keys
+            if pinned := sorted(managed_config_keys().intersection(written)):
+                raise _managed_refusal(pinned[0])
+            if cfg != before:
+                try:
+                    atomic_config_replace(path, cfg)
+                except Exception as exc:
+                    raise AuthorityRefusal('storage_unavailable') from exc
+            return result
 
 
 def _authorize_write(connection, ref, params):

@@ -2262,7 +2262,13 @@ def resolve_external_process_provider_credentials(provider_id: str) -> dict[str,
 
 # ── CLI Commands — login / logout ───────────────────────────────────────────────────────────────────
 
-def _update_config_for_provider(
+def _update_config_for_provider(*args, **kwargs):
+    from hermes_cli.config import _config_write_lock, get_config_path
+    with _config_write_lock(get_config_path()):
+        return _update_config_for_provider_locked(*args, **kwargs)
+
+
+def _update_config_for_provider_locked(
     provider_id: str, inference_base_url: str, default_model: Optional[str] = None,
     *, clear_default: bool = False) -> Path:
     """Update config.yaml and auth.json to reflect the active provider.
@@ -2337,6 +2343,12 @@ def _logout_default_provider_from_config() -> Optional[str]:
 
 
 def _reset_config_provider() -> Path:
+    from hermes_cli.config import _config_write_lock, get_config_path
+    with _config_write_lock(get_config_path()):
+        return _reset_config_provider_locked()
+
+
+def _reset_config_provider_locked() -> Path:
     """Reset config.yaml provider back to auto after logout."""
     config_path = get_config_path()
     if not config_exists(config_path):

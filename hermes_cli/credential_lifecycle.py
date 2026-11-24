@@ -81,18 +81,30 @@ def _prune_env_pool_entries(env_var: str) -> list[str]:
 
 
 def _scrub_config_yaml_mirrors(old_value: str, new_value: str | None) -> list[str]:
-    """Reconcile config.yaml api_key mirrors holding ``old_value``; return dotted paths touched.
+    """Reconcile config.yaml mirrors of ``old_value`` under the config write lock.
 
-    Value-matched on purpose: only an entry holding the SAME credential that just changed in
-    ``.env`` is touched. ``new_value=None`` removes the field. Operates on the RAW user config
-    so defaults are never baked into the user's file.
+    P1-1 (2026-11-25): the previous body read, mutated and replaced config.yaml entirely
+    outside ``_config_write_lock``; a concurrent ``config set`` (CLI/cron/worker) could be
+    silently overwritten. The whole read-modify-replace cycle now runs while holding the
+    cross-process lock, so a credential rotation cannot drop another writer's key.
     """
-    from hermes_cli.config_backend import config_exists
     if not old_value:
         return []
-    from hermes_cli.config import atomic_config_replace, get_config_path, read_user_config_raw
+    from hermes_cli.config import _config_write_lock, get_config_path
 
     config_path = get_config_path()
+    with _config_write_lock(config_path):
+        return _scrub_config_yaml_mirrors_locked(old_value, new_value, config_path)
+
+
+def _scrub_config_yaml_mirrors_locked(old_value: str, new_value: str | None,
+                                     config_path: Path) -> list[str]:
+    """Body of :func:`_scrub_config_yaml_mirrors`; caller holds the config write lock."""
+    from hermes_cli.config_backend import config_exists
+    from hermes_cli.config import atomic_config_replace, read_user_config_raw
+
+    if not old_value:
+        return []
     if not config_exists(config_path):
         return []
     try:

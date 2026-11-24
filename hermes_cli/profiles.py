@@ -743,10 +743,12 @@ def _seed_model_config(profile_dir: Path) -> None:
         from hermes_constants import get_hermes_home
         from hermes_cli.config import atomic_config_write, read_user_config_raw
         from hermes_cli.profile_model_seed import launch_model_seed
+        from hermes_cli.config import _config_write_lock
         source = get_hermes_home() / "config.yaml"
-        seed = launch_model_seed(read_user_config_raw(source)) if config_exists(source) else {}
-        if seed:
-            atomic_config_write(config_path, seed)
+        with _config_write_lock(config_path):
+            seed = launch_model_seed(read_user_config_raw(source)) if config_exists(source) else {}
+            if seed:
+                atomic_config_write(config_path, seed)
 
 
 def _check_gateway_running(profile_dir: Path) -> bool:

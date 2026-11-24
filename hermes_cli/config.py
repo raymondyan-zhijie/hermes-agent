@@ -2259,7 +2259,12 @@ def _commented_sections_for_save(normalized: dict[str, Any]) -> Optional[str]:
     return "".join(parts) or None
 
 
-def save_config(
+def save_config(*args: Any, **kwargs: Any):
+    with _config_write_lock(get_config_path()):
+        return _save_config_locked(*args, **kwargs)
+
+
+def _save_config_locked(
     config: dict[str, Any], *, strip_defaults: bool = True,
     preserve_keys: Optional[set[tuple[str, ...]]] = None, merge_existing: bool = False):
     """Save configuration to ~/.hermes/config.yaml.
@@ -2427,6 +2432,48 @@ def _env_write_lock(env_path: Path):
         _env_write_lock_holder(env_path),
         15.0,
         f"Timed out waiting for the environment file lock ({env_path})",
+    ):
+        yield
+
+
+_CONFIG_WRITE_LOCK_HOLDERS: dict[str, Any] = {}
+_CONFIG_WRITE_LOCK_HOLDERS_GUARD = threading.Lock()
+
+
+def _config_write_lock_holder(config_path: Path) -> Any:
+    """Reentrancy tracker for one canonical config.yaml path (multiplexed profiles each get one)."""
+    key = str(config_path.resolve())
+    with _CONFIG_WRITE_LOCK_HOLDERS_GUARD:
+        return _CONFIG_WRITE_LOCK_HOLDERS.setdefault(key, threading.local())
+
+
+@contextmanager
+def _config_write_lock(config_path: Path):
+    """Serialize a whole ``config.yaml`` read-modify-write cycle, cross-process.
+
+    ``set_config_value`` / ``unset_config_value`` read the raw user config, mutate it in
+    memory, then atomically replace the file. Without a lock two concurrent writers
+    (CLI + gateway, two DMs, a card worker + a human shell) both snapshot the pre-write
+    file and the loser's replace silently drops the winner's key — both sides print
+    ``✓ Set`` and exit 0. ``_CONFIG_LOCK`` cannot help: it guards in-process state only,
+    and ``_write_user_config``'s atomic replace only guarantees torn-write freedom.
+
+    Reuses ``hermes_cli.auth._file_lock`` (fcntl flock / msvcrt byte lock, cross-process,
+    reentrant per thread) exactly like ``_env_write_lock`` above; the lock file lives next
+    to the config (``config.yaml.lock``) so separate profiles never contend. Lock ordering:
+    callers may take the ``.env`` write lock while holding this one (``set_config_value``
+    syncs ``TERMINAL_*`` via ``save_env_value``); nothing takes this lock while holding the
+    ``.env`` lock, so there is a single ordering and no cycle. On a filesystem without
+    flock the helper degrades to a depth-only guard, never to a crash.
+    """
+    from hermes_cli.auth import _file_lock
+
+    config_path = config_path.resolve()
+    with _file_lock(
+        config_path.with_name(config_path.name + ".lock"),
+        _config_write_lock_holder(config_path),
+        15.0,
+        f"Timed out waiting for the config file lock ({config_path})",
     ):
         yield
 
@@ -3160,6 +3207,15 @@ def set_config_value(key: str, value: str, force: bool = False):
     if is_managed():
         managed_error("set configuration values")
         return
+    with _config_write_lock(get_config_path()):
+        return _set_config_value_locked(key, value, force)
+
+
+def _set_config_value_locked(key: str, value: str, force: bool = False):
+    """Body of :func:`set_config_value`; the caller holds the cross-process config write lock."""
+    if is_managed():
+        managed_error("set configuration values")
+        return
     # Empty segments (``"agent."``) would write config["agent"][""] into a live schema section.
     if key != key.strip() or not key.strip():
         _exit_invalid(f"✗ Invalid config key: {key!r} (empty or surrounding whitespace).")
@@ -3328,6 +3384,15 @@ def unset_config_value(key: str):
     if is_managed():
         managed_error("unset configuration values")
         return
+    with _config_write_lock(get_config_path()):
+        return _unset_config_value_locked(key)
+
+
+def _unset_config_value_locked(key: str):
+    """Body of :func:`unset_config_value`; the caller holds the cross-process config write lock."""
+    if is_managed():
+        managed_error("unset configuration values")
+        return
     _exit_if_key_managed(key, "unset")
 
     if _is_env_config_key(key):
@@ -3400,6 +3465,8 @@ def _run_write_command(fn, *args) -> None:
         fn(*args)
     except RuntimeError as exc:
         _exit_invalid(f"✗ {exc}")
+    except TimeoutError as exc:
+        _exit_invalid(f"✗ 配置写锁超时（另一进程长时间持有锁）：{exc}")
 
 
 _USAGE_GET = ("Usage: hermes config get <key> [--json] [--raw]", [
