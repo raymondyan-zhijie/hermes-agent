@@ -182,11 +182,6 @@ _GIT_STAGE_TIMEOUT: int = max(10, min(600, env_int("HERMES_CHECKPOINT_STAGE_TIME
 # is fatal before any entry is read (measured, git 2.53).
 _STALE_LOCK_AGE_S: int = max(0, env_int("HERMES_CHECKPOINT_STALE_LOCK_AGE", 30))
 
-# Upper bound on generated pathspec exclusions for oversize files.  Past it the
-# pre-stage filter gives up and the post-stage drop stays the only guard, so a
-# pathological project cannot push the argument list at ARG_MAX.
-_MAX_PATHSPEC_EXCLUDES = 2000
-
 # Max entries to snapshot — skip huge directories to avoid slowdowns.  The count
 # comes from ``_dir_file_count`` (``rglob('*')``), so it includes directories, and
 # it is overridable per host because a working tree can legitimately outgrow a
