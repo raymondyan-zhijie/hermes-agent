@@ -721,6 +721,29 @@ def _index_lock_blocked(stderr: str) -> bool:
     )
 
 
+# ── D2（2026-11-25 卡 t_766d2493）：易变根目录不建快照 ────────────────
+# 任何一次工具调用 cwd=/tmp 写文件都会注册项目并开拍（实测 /tmp 幻影项目：
+# 6,642 文件 / 16 提交 / 60 MiB），且会把 root 属主的 systemd-private-* 等
+# 瞬态件带进 fail-closed。这些目录没有回滚价值。
+# /run/media 是真实挂载（U 盘/移动盘），不是易变根，必须排除在外。
+_VOLATILE_ROOTS = (Path("/tmp"), Path("/var/tmp"), Path("/dev/shm"), Path("/run"))
+_VOLATILE_EXCEPTIONS = (Path("/run/media"),)
+
+
+def _is_volatile_root(working_dir: str) -> bool:
+    """Whether *working_dir* lives under a throwaway root (never snapshot)."""
+    try:
+        path = Path(working_dir).resolve()
+    except OSError:
+        return False
+    for root in _VOLATILE_ROOTS:
+        if path == root or path.is_relative_to(root):
+            if any(path == exc or path.is_relative_to(exc) for exc in _VOLATILE_EXCEPTIONS):
+                return False
+            return True
+    return False
+
+
 def _parse_stage_stderr(stderr: str) -> Tuple[List[str], List[str]]:
     """Split failed ``git add`` stderr into (complaints, ignored-path names).
 
@@ -789,6 +812,26 @@ def _stage_partial(stderr: str) -> bool:
         and len(_MSG_TOKEN_BOUNDARY_RE.findall(_outside_quotes(line))) < 2
         for line in complaints
     )
+
+
+# ── D1（2026-11-25 卡 t_766d2493）：rc=128 `fatal: unable to stat` 重试一次 ──
+# 成因：git add 枚举后文件被 rename/删除（cron .tmp、心跳原子写）⇒ rc=128，
+# 整项目 fail-closed。实测 4 笔/24h。只认该精确消息，且行内拼接第 2 个消息
+# 令牌（引号外）时不重试 —— 与 _stage_partial 同一道 fail-closed 护栏。
+_TRANSIENT_STAT_RE = re.compile(r"^fatal: unable to stat ", re.M)
+
+
+def _transient_stat_failure(stderr: str) -> bool:
+    """Whether *stderr* is the rename/remove race that a single retry clears."""
+    text = stderr or ""
+    if not _TRANSIENT_STAT_RE.search(text):
+        return False
+    for line in text.splitlines():
+        if "fatal: unable to stat " not in line:
+            continue
+        if len(_MSG_TOKEN_BOUNDARY_RE.findall(_outside_quotes(line))) >= 2:
+            return False
+    return True
 
 
 def _skipped_entries(stderr: str) -> List[str]:
@@ -1096,6 +1139,8 @@ def _volume_evidence(workdir: Path) -> dict:
 
 def _register_project(store: Path, working_dir: str) -> None:
     """Create or update ``projects/<hash>.json`` with workdir + timestamps."""
+    if _is_volatile_root(working_dir):
+        return
     dir_hash = _project_hash(working_dir)
     meta_path = _project_meta_path(store, dir_hash)
     now = time.time()
@@ -2038,6 +2083,13 @@ class CheckpointManager:
                         lock, working_dir, _STALE_LOCK_AGE_S,
                     )
                     continue
+            if attempt == 0 and _transient_stat_failure(err):
+                logger.warning(
+                    "Checkpoint: transient 'unable to stat' while staging %s "
+                    "(file renamed/removed during add); retrying once", working_dir,
+                )
+                time.sleep(0.5)
+                continue
             return False, err, skipped
         return False, err, skipped
 
@@ -2096,6 +2148,12 @@ class CheckpointManager:
     def _take(self, working_dir: str, reason: str, *, prune: bool = True) -> bool:
         """Take a snapshot.  Returns True on success."""
         store = _store_path()
+
+        # D2（2026-11-25）：易变根目录（/tmp 等）不建快照。放在 _init_store 之前：
+        # 连 projects/<hash>.json 都不注册，避免 /tmp 幻影项目再生。
+        if _is_volatile_root(working_dir):
+            logger.debug("Checkpoint skipped: volatile root (%s)", working_dir)
+            return False
 
         err = _init_store(store, working_dir)
         if err:
