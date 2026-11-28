@@ -282,9 +282,12 @@ def _nested_head_unborn(repo_dir: str) -> bool:
     commit checked out``). A nested repo that *has* a commit is staged as a
     gitlink by design (the v0.23.0 contract) and must not be excluded.
     """
+    git = resolve_usable_git(os.environ)
+    if git is None:
+        return False
     try:
         done = subprocess.run(
-            ["git", "-C", repo_dir, "rev-parse", "--verify", "--quiet", "HEAD"],
+            [git, "-C", repo_dir, "rev-parse", "--verify", "--quiet", "HEAD"],
             capture_output=True, timeout=5,
         )
     except (OSError, subprocess.SubprocessError):
@@ -732,7 +735,14 @@ _VOLATILE_EXCEPTIONS = (Path("/run/media"),)
 
 
 def _is_volatile_root(working_dir: str) -> bool:
-    """Whether *working_dir* lives under a throwaway root (never snapshot)."""
+    """Whether *working_dir* lives under a throwaway root (never snapshot).
+
+    ``HERMES_CHECKPOINT_ALLOW_VOLATILE_ROOTS=1`` disables the skip for test and
+    maintenance runs that intentionally use a temporary directory; production
+    never sets it.
+    """
+    if os.environ.get("HERMES_CHECKPOINT_ALLOW_VOLATILE_ROOTS", "").strip().lower() in {"1", "true", "yes"}:
+        return False
     try:
         path = Path(working_dir).resolve()
     except OSError:
